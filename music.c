@@ -1,5 +1,4 @@
 //clang -framework AudioToolbox -framework Foundation -framework MediaPlayer -framework AppKit main.m -o player
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +24,7 @@ typedef struct {
     bool                         isPaused;
     AudioQueueBufferRef          buffers[NUM_BUFFERS];
     dispatch_source_t            uiTimer;
+    id                           activity; // 用于防止 App Nap
 } PlayerState;
 
 void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer);
@@ -115,6 +115,11 @@ int main(int argc, const char * argv[]) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         PlayerState *state = calloc(1, sizeof(PlayerState));
+        
+        // M3 性能优化：通过系统 API 开启高性能/低延迟模式，防止 App Nap
+        state->activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical | NSActivityIdleSystemSleepDisabled 
+                                                                         reason:@"High Performance Audio Playback"];
+
         strncpy(state->filename, argv[1], 255);
         CFURLRef url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (__bridge CFStringRef)[NSString stringWithUTF8String:argv[1]], kCFURLPOSIXPathStyle, false);
         if (ExtAudioFileOpenURL(url, &state->playbackFile) != noErr) { printf("File error\n"); return 1; }
@@ -123,17 +128,26 @@ int main(int argc, const char * argv[]) {
         AudioStreamBasicDescription fFmt; UInt32 ps = sizeof(fFmt);
         ExtAudioFileGetProperty(state->playbackFile, kExtAudioFileProperty_FileDataFormat, &ps, &fFmt);
         state->sampleRate = (fFmt.mSampleRate > 0) ? fFmt.mSampleRate : 44100;
+        
+        // M3 原生最佳性能格式：32-bit Float PCM
         state->clientFormat = (AudioStreamBasicDescription){ .mSampleRate = state->sampleRate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, .mBitsPerChannel = 32, .mChannelsPerFrame = fFmt.mChannelsPerFrame, .mFramesPerPacket = 1, .mBytesPerFrame = 4 * fFmt.mChannelsPerFrame, .mBytesPerPacket = 4 * fFmt.mChannelsPerFrame };
+        
+        // ExtAudioFileSetProperty 会自动协调底层的硬件解码器 (Hardware Codec)
         ExtAudioFileSetProperty(state->playbackFile, kExtAudioFileProperty_ClientDataFormat, sizeof(state->clientFormat), &state->clientFormat);
+        
         ps = sizeof(state->totalFrames);
         ExtAudioFileGetProperty(state->playbackFile, kExtAudioFileProperty_FileLengthFrames, &ps, &state->totalFrames);
         state->duration = (double)state->totalFrames / state->sampleRate;
 
+        // 创建音频队列
         AudioQueueNewOutput(&state->clientFormat, HandleOutputBuffer, state, NULL, NULL, 0, &state->queue);
+
+        // 分配 128KB 缓冲区，减少 I/O 频率以降低 M3 CPU 唤醒次数
         for (int i = 0; i < NUM_BUFFERS; i++) {
             AudioQueueAllocateBuffer(state->queue, 128*1024, &state->buffers[i]);
             HandleOutputBuffer(state, state->queue, state->buffers[i]);
         }
+        
         setupRemoteCommands(state);
         resumePlayback(state);
 
@@ -153,22 +167,21 @@ int main(int argc, const char * argv[]) {
                 }
             }
             setTerminalRawMode(false);
+            if (state->activity) [[NSProcessInfo processInfo] endActivity:state->activity];
             printf("\nFinished: %s\n", state->filename);
             exit(0);
         });
 
         state->uiTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-        dispatch_source_set_timer(state->uiTimer, DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC, 0.05 * NSEC_PER_SEC);
+        dispatch_source_set_timer(state->uiTimer, DISPATCH_TIME_NOW, 0.15 * NSEC_PER_SEC, 0.05 * NSEC_PER_SEC);
         dispatch_source_set_event_handler(state->uiTimer, ^{
             SInt64 cf = 0; ExtAudioFileTell(state->playbackFile, &cf);
             double cur = (double)cf/state->sampleRate;
             int curM = (int)cur/60, curS = (int)cur%60;
             int durM = (int)state->duration/60, durS = (int)state->duration%60;
-            
-            // 使用纯文本状态显示，去除了 Emoji 图标
+            // 单行刷新逻辑
             printf("\r\033[2K%s [%02d:%02d / %02d:%02d] (Space: Pause, Arrows: Seek, Q: Quit)", 
-                   state->isPaused ? "PAUSED " : "PLAYING", 
-                   curM, curS, durM, durS);
+                   state->isPaused ? "PAUSED " : "PLAYING", curM, curS, durM, durS);
             fflush(stdout);
         });
         dispatch_resume(state->uiTimer);
