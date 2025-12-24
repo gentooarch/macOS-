@@ -1,286 +1,178 @@
-//clang -o music main.m -framework AudioToolbox -framework Foundation -framework MediaPlayer -framework AppKit
+clang -framework AudioToolbox -framework Foundation -framework MediaPlayer -framework AppKit main.m -o player
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <AppKit/AppKit.h>
 
 #define NUM_BUFFERS 3
-#define SEEK_STEP_SEC 5.0 // 快进快退的步长（秒）
+#define SEEK_STEP_SEC 5.0
 
 typedef struct {
-    AudioFileID                  playbackFile;
+    ExtAudioFileRef              playbackFile;
     AudioQueueRef                queue;
-    SInt64                       packetIndex;
-    UInt32                       numPacketsToRead;
-    AudioStreamPacketDescription *packetDescs;
-    bool                         isDone;
-    double                       duration;
+    AudioStreamBasicDescription  clientFormat;
+    SInt64                       totalFrames;
     double                       sampleRate;
+    double                       duration;
     char                         filename[256];
-    // 新增：保存 Buffer 引用，以便在 Seek 时重新填充
+    bool                         isDone;
+    bool                         isPaused;
     AudioQueueBufferRef          buffers[NUM_BUFFERS];
+    dispatch_source_t            uiTimer;
 } PlayerState;
 
-// 前向声明 (必须与定义保持一致，不加 static)
 void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer);
 
-// 更新系统“正在播放”面板的状态
 void updateNowPlaying(PlayerState *pState, bool isPlaying) {
-    MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
-    double currentTime = 0;
-    if (pState->sampleRate > 0) {
-        currentTime = (double)pState->packetIndex / pState->sampleRate;
-    }
-    
+    pState->isPaused = !isPlaying;
+    SInt64 currentFrame = 0;
+    ExtAudioFileTell(pState->playbackFile, &currentFrame);
+    double elapsed = (double)currentFrame / pState->sampleRate;
+
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
     info[MPMediaItemPropertyTitle] = [NSString stringWithUTF8String:pState->filename];
     info[MPMediaItemPropertyPlaybackDuration] = @(pState->duration);
-    info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(currentTime);
+    info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(elapsed);
     info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? @1.0 : @0.0;
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        center.nowPlayingInfo = info;
+        [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = info;
     });
 }
 
-// 执行跳转逻辑的核心函数
-void performSeek(PlayerState *pState, double offsetSeconds) {
-    // 1. 计算新的时间点
-    double currentTime = (double)pState->packetIndex / pState->sampleRate;
-    double targetTime = currentTime + offsetSeconds;
-    
-    // 边界检查
-    if (targetTime < 0) targetTime = 0;
-    if (targetTime > pState->duration) targetTime = pState->duration;
-    
-    // 2. 暂停并重置 AudioQueue (清除现有 Buffer 中的旧数据)
-    AudioQueueReset(pState->queue);
-    
-    // 3. 更新 Packet Index
-    pState->packetIndex = (SInt64)(targetTime * pState->sampleRate);
-    
-    // 4. 重新填充所有 Buffer
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        HandleOutputBuffer(pState, pState->queue, pState->buffers[i]);
-    }
-    
-    // 5. 重新开始播放
+void resumePlayback(PlayerState *pState) {
+    AudioQueuePrime(pState->queue, 0, NULL);
     AudioQueueStart(pState->queue, NULL);
-    
-    // 6. 更新 UI
     updateNowPlaying(pState, true);
 }
 
-// 修复：去掉了 static 关键字，与前向声明保持一致
+void pausePlayback(PlayerState *pState) {
+    AudioQueuePause(pState->queue);
+    updateNowPlaying(pState, false);
+}
+
+void performSeek(PlayerState *pState, double offsetSeconds) {
+    SInt64 currentFrame = 0;
+    ExtAudioFileTell(pState->playbackFile, &currentFrame);
+    SInt64 targetFrame = currentFrame + (SInt64)(offsetSeconds * pState->sampleRate);
+    if (targetFrame < 0) targetFrame = 0;
+    if (targetFrame > pState->totalFrames) targetFrame = pState->totalFrames;
+    
+    AudioQueueStop(pState->queue, true); 
+    ExtAudioFileSeek(pState->playbackFile, targetFrame);
+    for (int i = 0; i < NUM_BUFFERS; i++) HandleOutputBuffer(pState, pState->queue, pState->buffers[i]);
+    resumePlayback(pState);
+}
+
 void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
     PlayerState *pState = (PlayerState *)inUserData;
     if (pState->isDone) return;
-
-    UInt32 numBytesReadFromFile = inBuffer->mAudioDataBytesCapacity;
-    UInt32 numPackets = pState->numPacketsToRead;
-
-    OSStatus status = AudioFileReadPacketData(pState->playbackFile, false, &numBytesReadFromFile,
-                           pState->packetDescs, pState->packetIndex, &numPackets, inBuffer->mAudioData);
-
-    if (numPackets > 0) {
-        inBuffer->mAudioDataByteSize = numBytesReadFromFile;
-        status = AudioQueueEnqueueBuffer(inAQ, inBuffer, (pState->packetDescs ? numPackets : 0), pState->packetDescs);
-        pState->packetIndex += numPackets;
+    UInt32 frameCount = inBuffer->mAudioDataBytesCapacity / pState->clientFormat.mBytesPerFrame;
+    AudioBufferList bufferList = { .mNumberBuffers = 1, .mBuffers[0] = { 
+        .mNumberChannels = pState->clientFormat.mChannelsPerFrame,
+        .mDataByteSize = inBuffer->mAudioDataBytesCapacity, .mData = inBuffer->mAudioData } 
+    };
+    if (ExtAudioFileRead(pState->playbackFile, &frameCount, &bufferList) == noErr && frameCount > 0) {
+        inBuffer->mAudioDataByteSize = bufferList.mBuffers[0].mDataByteSize;
+        AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
     } else {
-        if (status == noErr) {
-             AudioQueueStop(inAQ, false);
-             pState->isDone = true;
-        }
+        AudioQueueStop(inAQ, false);
+        pState->isDone = true;
     }
 }
 
 void setupRemoteCommands(PlayerState *pState) {
-    MPRemoteCommandCenter *commandCenter = [MPRemoteCommandCenter sharedCommandCenter];
-    
-    [commandCenter.playCommand setEnabled:YES];
-    [commandCenter.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        AudioQueueStart(pState->queue, NULL);
-        updateNowPlaying(pState, true);
-        return MPRemoteCommandHandlerStatusSuccess;
+    MPRemoteCommandCenter *cc = [MPRemoteCommandCenter sharedCommandCenter];
+    [cc.playCommand setEnabled:YES];
+    [cc.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { resumePlayback(pState); return 0; }];
+    [cc.pauseCommand setEnabled:YES];
+    [cc.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { pausePlayback(pState); return 0; }];
+    [cc.togglePlayPauseCommand setEnabled:YES];
+    [cc.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        pState->isPaused ? resumePlayback(pState) : pausePlayback(pState); return 0;
     }];
-
-    [commandCenter.pauseCommand setEnabled:YES];
-    [commandCenter.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        AudioQueuePause(pState->queue);
-        updateNowPlaying(pState, false);
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-
-    [commandCenter.togglePlayPauseCommand setEnabled:YES];
-    [commandCenter.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        UInt32 isRunning;
-        UInt32 size = sizeof(isRunning);
-        AudioQueueGetProperty(pState->queue, kAudioQueueProperty_IsRunning, &isRunning, &size);
-        if (isRunning) {
-            AudioQueuePause(pState->queue);
-            updateNowPlaying(pState, false);
-        } else {
-            AudioQueueStart(pState->queue, NULL);
-            updateNowPlaying(pState, true);
-        }
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-    
-    [commandCenter.seekForwardCommand setEnabled:YES];
-    [commandCenter.seekForwardCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        performSeek(pState, SEEK_STEP_SEC);
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-    
-    [commandCenter.seekBackwardCommand setEnabled:YES];
-    [commandCenter.seekBackwardCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        performSeek(pState, -SEEK_STEP_SEC);
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
+    [cc.seekForwardCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e){ performSeek(pState, SEEK_STEP_SEC); return 0; }];
+    [cc.seekBackwardCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e){ performSeek(pState, -SEEK_STEP_SEC); return 0; }];
 }
 
 void setTerminalRawMode(bool enable) {
     static struct termios oldt, newt;
     if (enable) {
         tcgetattr(STDIN_FILENO, &oldt);
-        newt = oldt;
-        newt.c_lflag &= ~(ICANON | ECHO);
+        newt = oldt; newt.c_lflag &= ~(ICANON | ECHO);
         tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    } else {
-        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    }
-}
-
-void *inputThread(void *arg) {
-    PlayerState *state = (PlayerState *)arg;
-    setTerminalRawMode(true);
-    
-    while (!state->isDone) {
-        char c;
-        if (read(STDIN_FILENO, &c, 1) > 0) {
-            // 解析 ANSI 转义序列
-            if (c == '\033') { // ESC
-                char seq[2];
-                // 尝试快速读取接下来的序列
-                if (read(STDIN_FILENO, &seq[0], 1) > 0) {
-                    if (read(STDIN_FILENO, &seq[1], 1) > 0) {
-                        if (seq[0] == '[') {
-                            if (seq[1] == 'C') { // 右箭头
-                                performSeek(state, SEEK_STEP_SEC);
-                            } else if (seq[1] == 'D') { // 左箭头
-                                performSeek(state, -SEEK_STEP_SEC);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if (c == 'q') {
-                state->isDone = true;
-                break;
-            }
-            if (c == ' ') {
-                UInt32 isRunning;
-                UInt32 size = sizeof(isRunning);
-                AudioQueueGetProperty(state->queue, kAudioQueueProperty_IsRunning, &isRunning, &size);
-                if (isRunning) {
-                    AudioQueuePause(state->queue);
-                    updateNowPlaying(state, false);
-                } else {
-                    AudioQueueStart(state->queue, NULL);
-                    updateNowPlaying(state, true);
-                }
-            }
-        }
-    }
-    setTerminalRawMode(false);
-    AudioQueueStop(state->queue, true);
-    exit(0);
-    return NULL;
+    } else tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 }
 
 int main(int argc, const char * argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <audio_file>\n", argv[0]);
-        return 1;
-    }
-
+    if (argc < 2) { printf("Usage: %s <file>\n", argv[0]); return 1; }
     @autoreleasepool {
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-
         PlayerState *state = calloc(1, sizeof(PlayerState));
         strncpy(state->filename, argv[1], 255);
+        CFURLRef url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, (__bridge CFStringRef)[NSString stringWithUTF8String:argv[1]], kCFURLPOSIXPathStyle, false);
+        if (ExtAudioFileOpenURL(url, &state->playbackFile) != noErr) { printf("File error\n"); return 1; }
+        CFRelease(url);
 
-        CFURLRef fileURL = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)argv[1], strlen(argv[1]), false);
-        OSStatus status = AudioFileOpenURL(fileURL, kAudioFileReadPermission, 0, &state->playbackFile);
-        CFRelease(fileURL);
-        
-        if (status != noErr) {
-            printf("Error opening file\n");
-            return 1;
-        }
+        AudioStreamBasicDescription fFmt; UInt32 ps = sizeof(fFmt);
+        ExtAudioFileGetProperty(state->playbackFile, kExtAudioFileProperty_FileDataFormat, &ps, &fFmt);
+        state->sampleRate = (fFmt.mSampleRate > 0) ? fFmt.mSampleRate : 44100;
+        state->clientFormat = (AudioStreamBasicDescription){ .mSampleRate = state->sampleRate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, .mBitsPerChannel = 32, .mChannelsPerFrame = fFmt.mChannelsPerFrame, .mFramesPerPacket = 1, .mBytesPerFrame = 4 * fFmt.mChannelsPerFrame, .mBytesPerPacket = 4 * fFmt.mChannelsPerFrame };
+        ExtAudioFileSetProperty(state->playbackFile, kExtAudioFileProperty_ClientDataFormat, sizeof(state->clientFormat), &state->clientFormat);
+        ps = sizeof(state->totalFrames);
+        ExtAudioFileGetProperty(state->playbackFile, kExtAudioFileProperty_FileLengthFrames, &ps, &state->totalFrames);
+        state->duration = (double)state->totalFrames / state->sampleRate;
 
-        AudioStreamBasicDescription dataFormat;
-        UInt32 propSize = sizeof(dataFormat);
-        AudioFileGetProperty(state->playbackFile, kAudioFilePropertyDataFormat, &propSize, &dataFormat);
-        state->sampleRate = dataFormat.mSampleRate;
-        
-        Float64 totalDuration;
-        propSize = sizeof(totalDuration);
-        AudioFileGetProperty(state->playbackFile, kAudioFilePropertyEstimatedDuration, &propSize, &totalDuration);
-        state->duration = totalDuration;
-
-        AudioQueueNewOutput(&dataFormat, HandleOutputBuffer, state, NULL, NULL, 0, &state->queue);
-
-        setupRemoteCommands(state);
-        
-        UInt32 maxPacketSize;
-        propSize = sizeof(maxPacketSize);
-        AudioFileGetProperty(state->playbackFile, kAudioFilePropertyPacketSizeUpperBound, &propSize, &maxPacketSize);
-        
-        state->numPacketsToRead = (state->sampleRate / 10);
-        
-        if (dataFormat.mBytesPerPacket == 0) 
-            state->packetDescs = (AudioStreamPacketDescription *)malloc(sizeof(AudioStreamPacketDescription) * state->numPacketsToRead);
-
+        AudioQueueNewOutput(&state->clientFormat, HandleOutputBuffer, state, NULL, NULL, 0, &state->queue);
         for (int i = 0; i < NUM_BUFFERS; i++) {
-            AudioQueueAllocateBuffer(state->queue, state->numPacketsToRead * maxPacketSize, &state->buffers[i]);
+            AudioQueueAllocateBuffer(state->queue, 128*1024, &state->buffers[i]);
             HandleOutputBuffer(state, state->queue, state->buffers[i]);
         }
+        setupRemoteCommands(state);
+        resumePlayback(state);
 
-        AudioQueueStart(state->queue, NULL);
-        updateNowPlaying(state, true);
-
-        pthread_t tid;
-        pthread_create(&tid, NULL, inputThread, state);
-
-        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
-            if (state->isDone) {
-                [timer invalidate];
-                CFRunLoopStop(CFRunLoopGetCurrent());
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+            setTerminalRawMode(true);
+            while (!state->isDone) {
+                char c;
+                if (read(STDIN_FILENO, &c, 1) > 0) {
+                    if (c == 'q') { state->isDone = true; break; }
+                    if (c == ' ') { state->isPaused ? resumePlayback(state) : pausePlayback(state); }
+                    if (c == '\033') {
+                        char seq[2]; if (read(STDIN_FILENO, &seq[0], 1) > 0 && read(STDIN_FILENO, &seq[1], 1) > 0) {
+                            if (seq[1] == 'C') performSeek(state, SEEK_STEP_SEC);
+                            if (seq[1] == 'D') performSeek(state, -SEEK_STEP_SEC);
+                        }
+                    }
+                }
             }
-            double displayTime = 0;
-            if (state->sampleRate > 0)
-                 displayTime = (double)state->packetIndex / state->sampleRate;
-            
-            printf("\r\033[KPlaying: %.1f / %.1f sec [Space: Pause, Arrows: Seek, q: Quit]", displayTime, state->duration);
-            fflush(stdout);
-        }];
+            setTerminalRawMode(false);
+            printf("\nFinished: %s\n", state->filename);
+            exit(0);
+        });
 
-        [[NSRunLoop currentRunLoop] run];
-        
-        AudioQueueDispose(state->queue, true);
-        AudioFileClose(state->playbackFile);
-        if (state->packetDescs) free(state->packetDescs);
-        free(state);
+        state->uiTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(state->uiTimer, DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC, 0.05 * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(state->uiTimer, ^{
+            SInt64 cf = 0; ExtAudioFileTell(state->playbackFile, &cf);
+            double cur = (double)cf/state->sampleRate;
+            int curM = (int)cur/60, curS = (int)cur%60;
+            int durM = (int)state->duration/60, durS = (int)state->duration%60;
+            
+            // 使用纯文本状态显示，去除了 Emoji 图标
+            printf("\r\033[2K%s [%02d:%02d / %02d:%02d] (Space: Pause, Arrows: Seek, Q: Quit)", 
+                   state->isPaused ? "PAUSED " : "PLAYING", 
+                   curM, curS, durM, durS);
+            fflush(stdout);
+        });
+        dispatch_resume(state->uiTimer);
+        CFRunLoopRun();
     }
     return 0;
 }
