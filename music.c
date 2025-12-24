@@ -1,3 +1,4 @@
+//clang -O3 main.c -o music -framework AudioToolbox -framework CoreFoundation
 #include <stdio.h>
 #include <stdlib.h>
 #include <termios.h>
