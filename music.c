@@ -9,6 +9,8 @@
 #import <MediaPlayer/MediaPlayer.h>
 #import <AppKit/AppKit.h>
 
+// 增加缓冲区大小到 512KB，减少 I/O 频率和 CPU 唤醒次数
+#define BUFFER_SIZE 512 * 1024 
 #define NUM_BUFFERS 3
 #define SEEK_STEP_SEC 5.0
 
@@ -24,7 +26,7 @@ typedef struct {
     bool                         isPaused;
     AudioQueueBufferRef          buffers[NUM_BUFFERS];
     dispatch_source_t            uiTimer;
-    id                           activity; // 用于防止 App Nap
+    id                           activity; 
 } PlayerState;
 
 void HandleOutputBuffer(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer);
@@ -116,7 +118,7 @@ int main(int argc, const char * argv[]) {
         [NSApplication sharedApplication];
         PlayerState *state = calloc(1, sizeof(PlayerState));
         
-        // M3 性能优化：通过系统 API 开启高性能/低延迟模式，防止 App Nap
+        // 开启低延迟和防止休眠模式
         state->activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical | NSActivityIdleSystemSleepDisabled 
                                                                          reason:@"High Performance Audio Playback"];
 
@@ -129,22 +131,19 @@ int main(int argc, const char * argv[]) {
         ExtAudioFileGetProperty(state->playbackFile, kExtAudioFileProperty_FileDataFormat, &ps, &fFmt);
         state->sampleRate = (fFmt.mSampleRate > 0) ? fFmt.mSampleRate : 44100;
         
-        // M3 原生最佳性能格式：32-bit Float PCM
         state->clientFormat = (AudioStreamBasicDescription){ .mSampleRate = state->sampleRate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, .mBitsPerChannel = 32, .mChannelsPerFrame = fFmt.mChannelsPerFrame, .mFramesPerPacket = 1, .mBytesPerFrame = 4 * fFmt.mChannelsPerFrame, .mBytesPerPacket = 4 * fFmt.mChannelsPerFrame };
         
-        // ExtAudioFileSetProperty 会自动协调底层的硬件解码器 (Hardware Codec)
         ExtAudioFileSetProperty(state->playbackFile, kExtAudioFileProperty_ClientDataFormat, sizeof(state->clientFormat), &state->clientFormat);
         
         ps = sizeof(state->totalFrames);
         ExtAudioFileGetProperty(state->playbackFile, kExtAudioFileProperty_FileLengthFrames, &ps, &state->totalFrames);
         state->duration = (double)state->totalFrames / state->sampleRate;
 
-        // 创建音频队列
         AudioQueueNewOutput(&state->clientFormat, HandleOutputBuffer, state, NULL, NULL, 0, &state->queue);
 
-        // 分配 128KB 缓冲区，减少 I/O 频率以降低 M3 CPU 唤醒次数
+        // 使用 512KB 缓冲区
         for (int i = 0; i < NUM_BUFFERS; i++) {
-            AudioQueueAllocateBuffer(state->queue, 128*1024, &state->buffers[i]);
+            AudioQueueAllocateBuffer(state->queue, BUFFER_SIZE, &state->buffers[i]);
             HandleOutputBuffer(state, state->queue, state->buffers[i]);
         }
         
@@ -172,14 +171,14 @@ int main(int argc, const char * argv[]) {
             exit(0);
         });
 
+        // 优化：将定时器改为 1.0 秒刷新一次，并增加 leeway (容差) 以便系统合并任务省电
         state->uiTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-        dispatch_source_set_timer(state->uiTimer, DISPATCH_TIME_NOW, 0.15 * NSEC_PER_SEC, 0.05 * NSEC_PER_SEC);
+        dispatch_source_set_timer(state->uiTimer, DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
         dispatch_source_set_event_handler(state->uiTimer, ^{
             SInt64 cf = 0; ExtAudioFileTell(state->playbackFile, &cf);
             double cur = (double)cf/state->sampleRate;
             int curM = (int)cur/60, curS = (int)cur%60;
             int durM = (int)state->duration/60, durS = (int)state->duration%60;
-            // 单行刷新逻辑
             printf("\r\033[2K%s [%02d:%02d / %02d:%02d] (Space: Pause, Arrows: Seek, Q: Quit)", 
                    state->isPaused ? "PAUSED " : "PLAYING", curM, curS, durM, durS);
             fflush(stdout);
