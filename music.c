@@ -1,4 +1,4 @@
-clang -framework AudioToolbox -framework Foundation -framework MediaPlayer -framework AppKit main.m -o player
+//clang -framework AudioToolbox -framework Foundation -framework MediaPlayer -framework AppKit main.m -o player
 
 #include <stdio.h>
 #include <stdlib.h>
