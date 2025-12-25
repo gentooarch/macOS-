@@ -1,4 +1,5 @@
-//clang -O3 -framework Cocoa -framework QuartzCore -framework UniformTypeIdentifiers -fobjc-arc main.m -o MiniPDF
+// 编译命令: clang -O3 -framework Cocoa -framework QuartzCore -framework UniformTypeIdentifiers -fobjc-arc main.m -o MiniPDF
+
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -13,6 +14,7 @@
 - (void)loadDocument:(NSString *)path;
 - (void)nextPage;
 - (void)prevPage;
+- (void)resizeToFitWidth;
 @end
 
 @implementation EfficientPDFView
@@ -21,35 +23,47 @@
     self = [super initWithFrame:frame];
     if (self) {
         self.wantsLayer = YES;
+        self.layer.backgroundColor = [[NSColor darkGrayColor] CGColor]; // 背景深色，方便看清边界
+        
         _contentLayer = [CALayer layer];
         _contentLayer.contentsGravity = kCAGravityResizeAspect;
-        // 禁用隐式动画，提高响应速度
-        _contentLayer.actions = @{@"contents": [NSNull null]};
+        _contentLayer.actions = @{@"contents": [NSNull null], @"bounds": [NSNull null], @"position": [NSNull null]};
+        // 关键：设置图层的缩放倍率
+        _contentLayer.contentsScale = [[NSScreen mainScreen] backingScaleFactor];
         [self.layer addSublayer:_contentLayer];
     }
     return self;
 }
 
-- (void)setFrame:(NSRect)frame {
-    [super setFrame:frame];
+// 强制不响应横向滚动
+- (void)resizeToFitWidth {
+    if (!_document || !self.enclosingScrollView) return;
+
+    CGPDFPageRef page = CGPDFDocumentGetPage(_document, _currentPage);
+    if (!page) return;
+
+    // 获取滚动视图实际可见的宽度（去掉滚动条后的空间）
+    CGFloat availableWidth = self.enclosingScrollView.contentSize.width;
+    
+    CGRect pageRect = CGPDFPageGetBoxRect(page, kCGPDFMediaBox);
+    CGFloat aspectRatio = pageRect.size.height / pageRect.size.width;
+    CGFloat targetHeight = availableWidth * aspectRatio;
+
+    // 更新视图大小：宽度严格等于容器宽，高度按比例伸缩
+    [self setFrameSize:NSMakeSize(availableWidth, targetHeight)];
     _contentLayer.frame = self.bounds;
+    
     [self renderCurrentPageAsync];
 }
 
 - (void)loadDocument:(NSString *)path {
     if (_document) CGPDFDocumentRelease(_document);
-    
-    // 修正：使用 NSURL 自动处理相对路径和绝对路径
-    NSURL *url = [NSURL fileURLWithPath:path];
-    _document = CGPDFDocumentCreateWithURL((__bridge CFURLRef)url);
+    _document = CGPDFDocumentCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path]);
     
     if (_document) {
         _totalPages = CGPDFDocumentGetNumberOfPages(_document);
         _currentPage = 1;
-        NSLog(@"PDF Loaded: %zu pages", _totalPages);
-        [self renderCurrentPageAsync];
-    } else {
-        NSLog(@"Failed to load PDF at path: %@", path);
+        [self resizeToFitWidth];
     }
 }
 
@@ -61,62 +75,75 @@
     CGPDFDocumentRetain(doc);
     
     CGFloat screenScale = [[NSScreen mainScreen] backingScaleFactor];
-    // 避免在后台线程访问 self.bounds，提前获取尺寸
-    CGSize layerSize = self.bounds.size; 
+    // 使用当前视图的实际宽度进行渲染计算
+    CGSize targetSize = self.bounds.size; 
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         CGPDFPageRef page = CGPDFDocumentGetPage(doc, pageNum);
         if (!page) { CGPDFDocumentRelease(doc); return; }
 
         CGRect pageRect = CGPDFPageGetBoxRect(page, kCGPDFMediaBox);
-        // 计算缩放比例：将 PDF 完整放入视图中
-        CGFloat scaleX = layerSize.width / pageRect.size.width;
-        CGFloat scaleY = layerSize.height / pageRect.size.height;
-        CGFloat fitScale = MIN(scaleX, scaleY);
         
-        // 渲染倍率：2.0 保证清晰度，若追求极致速度可降为 1.0
-        CGFloat renderScale = fitScale * screenScale; 
+        // 渲染比例计算
+        CGFloat renderScale = (targetSize.width / pageRect.size.width) * screenScale;
         
-        size_t width = pageRect.size.width * renderScale;
-        size_t height = pageRect.size.height * renderScale;
+        size_t w = targetSize.width * screenScale;
+        size_t h = targetSize.height * screenScale;
         
-        // 防止无效尺寸
-        if (width < 1 || height < 1) { CGPDFDocumentRelease(doc); return; }
+        if (w < 1 || h < 1) { CGPDFDocumentRelease(doc); return; }
 
-        CGContextRef bctx = CGBitmapContextCreate(NULL, width, height, 8, 0, 
-                                                 CGColorSpaceCreateDeviceRGB(), 
-                                                 kCGImageAlphaPremultipliedLast);
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bctx = CGBitmapContextCreate(NULL, w, h, 8, 0, colorSpace, kCGImageAlphaPremultipliedLast);
+        CGColorSpaceRelease(colorSpace);
         
         if (!bctx) { CGPDFDocumentRelease(doc); return; }
 
-        CGContextSetInterpolationQuality(bctx, kCGInterpolationDefault);
+        // 填充白色背景（PDF 页面通常是透明或白色的）
+        CGContextSetRGBFillColor(bctx, 1, 1, 1, 1);
+        CGContextFillRect(bctx, CGRectMake(0, 0, w, h));
+
         CGContextScaleCTM(bctx, renderScale, renderScale);
         CGContextDrawPDFPage(bctx, page);
-
+        
         CGImageRef image = CGBitmapContextCreateImage(bctx);
+        CGContextRelease(bctx);
         
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_contentLayer.contents = (__bridge id)image;
             CGImageRelease(image);
-            CGContextRelease(bctx);
             CGPDFDocumentRelease(doc);
         });
     });
 }
 
 - (void)nextPage {
-    if (_currentPage < _totalPages) { _currentPage++; [self renderCurrentPageAsync]; }
+    if (_currentPage < _totalPages) { 
+        _currentPage++; 
+        [self resizeToFitWidth];
+        [self scrollToTop];
+    }
 }
 
 - (void)prevPage {
-    if (_currentPage > 1) { _currentPage--; [self renderCurrentPageAsync]; }
+    if (_currentPage > 1) { 
+        _currentPage--; 
+        [self resizeToFitWidth];
+        [self scrollToTop];
+    }
+}
+
+- (void)scrollToTop {
+    NSPoint topPoint = NSMakePoint(0, self.frame.size.height - self.enclosingScrollView.contentSize.height);
+    if (topPoint.y < 0) topPoint.y = 0;
+    [[self.enclosingScrollView contentView] scrollToPoint:topPoint];
+    [self.enclosingScrollView reflectScrolledClipView:[self.enclosingScrollView contentView]];
 }
 
 - (BOOL)acceptsFirstResponder { return YES; }
 - (void)keyDown:(NSEvent *)event {
     uint16_t keyCode = [event keyCode];
-    if (keyCode == 124 || keyCode == 49) [self nextPage]; // 右箭头 / 空格
-    else if (keyCode == 123) [self prevPage];             // 左箭头
+    if (keyCode == 124 || keyCode == 49) [self nextPage]; // 右 / 空格
+    else if (keyCode == 123) [self prevPage];             // 左
 }
 @end
 
@@ -124,43 +151,48 @@
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property (strong) NSWindow *window;
 @property (strong) EfficientPDFView *pdfView;
+@property (strong) NSScrollView *scrollView;
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    // 修正：强制将应用设为普通应用（显示 Dock 图标和菜单栏），否则命令行启动不会显示窗口
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     
-    NSRect frame = NSMakeRect(0, 0, 800, 1000);
-    // 居中显示
-    NSRect screenRect = [[NSScreen mainScreen] visibleFrame];
-    frame.origin.x = (screenRect.size.width - frame.size.width) / 2;
-    frame.origin.y = (screenRect.size.height - frame.size.height) / 2;
-
-    self.window = [[NSWindow alloc] initWithContentRect:frame
+    // 创建初始窗口
+    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1000, 800)
                                              styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskResizable | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable)
-                                               backing:NSBackingStoreBuffered
-                                                 defer:NO];
-    [self.window setTitle:@"Ultra-Efficient PDF"];
+                                               backing:NSBackingStoreBuffered defer:NO];
+    [self.window setTitle:@"MiniPDF - Fixed Width"];
     [self.window setDelegate:self];
     
-    self.pdfView = [[EfficientPDFView alloc] initWithFrame:[self.window contentView].bounds];
-    // 设置自动调整大小，确保拖拽窗口时 View 跟着变
-    [self.pdfView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    // 设置滚动视图
+    self.scrollView = [[NSScrollView alloc] initWithFrame:[self.window contentView].bounds];
+    [self.scrollView setHasVerticalScroller:YES];
+    [self.scrollView setHasHorizontalScroller:NO]; // 彻底禁用横向滚动条
+    [self.scrollView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [self.scrollView setDrawsBackground:YES];
+    [self.scrollView setBackgroundColor:[NSColor darkGrayColor]];
+
+    // 设置 PDF 视图
+    self.pdfView = [[EfficientPDFView alloc] initWithFrame:self.scrollView.bounds];
+    // 关键：不要给 pdfView 设置 WidthSizable 的 AutoresizingMask，
+    // 因为我们要通过代码精确控制它的 Frame 宽度。
     
-    [self.window setContentView:self.pdfView];
+    [self.scrollView setDocumentView:self.pdfView];
+    [self.window setContentView:self.scrollView];
+    
+    // 全屏启动逻辑
+    [self.window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [self.window makeKeyAndOrderFront:nil];
+    [self.window toggleFullScreen:nil];
+
     [self.window makeFirstResponder:self.pdfView];
     
-    // 强制前台激活
-    [NSApp activateIgnoringOtherApps:YES];
-    
-    // 处理命令行参数
+    // 加载文件
     NSArray *args = [[NSProcessInfo processInfo] arguments];
     if (args.count > 1) {
-        NSString *filePath = args[1];
-        [self.pdfView loadDocument:filePath];
+        [self.pdfView loadDocument:args[1]];
     } else {
         NSOpenPanel *panel = [NSOpenPanel openPanel];
         panel.allowedContentTypes = @[[UTType typeWithIdentifier:@"com.adobe.pdf"]];
@@ -170,10 +202,14 @@
     }
 }
 
+// 核心：当窗口大小改变（包括进入全屏完成时），重新计算适配宽度
+- (void)windowDidResize:(NSNotification *)notification {
+    [self.pdfView resizeToFitWidth];
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
 @end
 
-// --- 主函数 ---
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
