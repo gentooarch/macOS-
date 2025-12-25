@@ -1,3 +1,4 @@
+//clang -fobjc-arc -framework AppKit -framework Metal -framework MetalKit -framework QuartzCore main.m -o MetalReader
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
