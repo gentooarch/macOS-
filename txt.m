@@ -30,8 +30,12 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
 }
 
 - (instancetype)initWithText:(NSString *)text {
-    self = [super initWithContentRect:NSMakeRect(0, 0, 900, 700)
-                            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskResizable | NSWindowStyleMaskClosable | NSWindowStyleMaskFullSizeContentView
+    NSUInteger masks = NSWindowStyleMaskTitled | NSWindowStyleMaskResizable | 
+                       NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | 
+                       NSWindowStyleMaskFullSizeContentView;
+    
+    self = [super initWithContentRect:NSMakeRect(0, 0, 1000, 800)
+                            styleMask:masks
                               backing:NSBackingStoreBuffered
                                 defer:NO];
     if (self) {
@@ -41,12 +45,17 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
         _device = MTLCreateSystemDefaultDevice();
         _queue = [_device newCommandQueue];
         
+        // --- 核心：绝对禁止磁盘写入 ---
+        [self setRestorable:NO];                   // 禁用窗口恢复
+        [self setIdentifier:nil];                  // 禁用偏好关联
+        [self setAnimationBehavior:NSWindowAnimationBehaviorNone]; // 禁用动画缓存
+        
         [self setupMetal];
         [self setupUI];
         
-        self.delegate = self;
-        [self setTitle:@"Metal Reader - 使用 PageUp/PageDown 翻页"];
-        [self setTitlebarAppearsTransparent:YES];
+        [self setDelegate:self];
+        [self setBackgroundColor:[NSColor blackColor]];
+        [self setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary]; 
         [self center];
     }
     return self;
@@ -75,10 +84,15 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
     [_textView setEditable:NO];
     [_textView setSelectable:YES];
     [_textView setBackgroundColor:[NSColor clearColor]];
+    [_textView setTextContainerInset:NSMakeSize(80, 60)]; 
     
-    // --- 关键设置：确保显示引擎没有额外边距 ---
-    [_textView setTextContainerInset:NSMakeSize(50, 40)];
-    _textView.textContainer.lineFragmentPadding = 0; // 禁用行左右内边距
+    // 禁用所有可能触发缓存的功能
+    [_textView setContinuousSpellCheckingEnabled:NO];
+    [_textView setAutomaticQuoteSubstitutionEnabled:NO];
+    [_textView setAutomaticDashSubstitutionEnabled:NO];
+    [_textView setAutomaticSpellingCorrectionEnabled:NO];
+    
+    _textView.textContainer.lineFragmentPadding = 0;
     
     [scroll setDocumentView:_textView];
     [_mtkView addSubview:scroll];
@@ -92,22 +106,22 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
     ]];
 }
 
-// 拦截 PageUp (116) 和 PageDown (121)
+// 拦截按键：仅保留 PgUp(116) / PgDn(121) / ESC(53)
 - (void)sendEvent:(NSEvent *)event {
     if (event.type == NSEventTypeKeyDown) {
-        if (event.keyCode == 121) { // Page Down
+        if (event.keyCode == 121) { 
             if (_currentPage < _pages.count - 1) {
                 _currentPage++;
                 [self updateContent];
             }
             return;
-        } else if (event.keyCode == 116) { // Page Up
+        } else if (event.keyCode == 116) { 
             if (_currentPage > 0) {
                 _currentPage--;
                 [self updateContent];
             }
             return;
-        } else if (event.keyCode == 53) { // ESC
+        } else if (event.keyCode == 53) { 
             [NSApp terminate:nil];
             return;
         }
@@ -115,39 +129,28 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
     [super sendEvent:event];
 }
 
-// 窗口完全激活后开始分页
-- (void)becomeKeyWindow {
-    [super becomeKeyWindow];
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        [self paginate];
-        [self updateContent];
-    });
-}
-
-// 精确分页算法
+// 精确分页逻辑
 - (void)paginate {
     [_pages removeAllObjects];
     
-    // 获取文字显示区域的纯净尺寸
     NSSize containerSize = _textView.bounds.size;
+    if (containerSize.width <= 0 || containerSize.height <= 0) return;
+
     CGFloat insetWidth = _textView.textContainerInset.width * 2;
     CGFloat insetHeight = _textView.textContainerInset.height * 2;
     NSSize renderSize = NSMakeSize(containerSize.width - insetWidth, containerSize.height - insetHeight);
 
-    // 统一属性（必须与 updateContent 保持完全一致）
-    NSFont *font = [NSFont systemFontOfSize:22];
-    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
-    style.lineSpacing = 8;
-    NSDictionary *attrs = @{ NSFontAttributeName: font, NSParagraphStyleAttributeName: style };
+    NSDictionary *attrs = @{ 
+        NSFontAttributeName: [NSFont systemFontOfSize:24], 
+        NSParagraphStyleAttributeName: [self paragraphStyle]
+    };
 
-    // 创建分页排版引擎
     NSTextStorage *textStorage = [[NSTextStorage alloc] initWithString:_fullText];
     [textStorage setAttributes:attrs range:NSMakeRange(0, textStorage.length)];
     
     NSLayoutManager *layoutManager = [[NSLayoutManager alloc] init];
     NSTextContainer *textContainer = [[NSTextContainer alloc] initWithSize:renderSize];
-    textContainer.lineFragmentPadding = 0; // 必须为 0
+    textContainer.lineFragmentPadding = 0;
     
     [layoutManager addTextContainer:textContainer];
     [textStorage addLayoutManager:layoutManager];
@@ -156,21 +159,14 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
     NSUInteger totalLen = _fullText.length;
 
     while (currentPos < totalLen) {
-        // 强制布局
         [layoutManager ensureLayoutForTextContainer:textContainer];
-        
-        // 获取当前容器内可见的字形范围
         NSRange glyphRange = [layoutManager glyphRangeForBoundingRect:NSMakeRect(0, 0, renderSize.width, renderSize.height)
                                                       inTextContainer:textContainer];
-        
-        // 转换为字符范围
+        // --- 此处修正：characterRangeForGlyphRange ---
         NSRange charRange = [layoutManager characterRangeForGlyphRange:glyphRange actualGlyphRange:NULL];
         
         if (charRange.length == 0) break;
-
         [_pages addObject:[NSValue valueWithRange:NSMakeRange(currentPos, charRange.length)]];
-        
-        // 核心：移除已处理部分，让 layoutManager 重新从 0 坐标开始排版下一段
         [textStorage deleteCharactersInRange:NSMakeRange(0, charRange.length)];
         currentPos += charRange.length;
     }
@@ -180,31 +176,38 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
     }
 }
 
+- (NSParagraphStyle *)paragraphStyle {
+    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
+    style.lineSpacing = 10;
+    style.paragraphSpacing = 15;
+    return style;
+}
+
 - (void)updateContent {
     if (_pages.count == 0) return;
-    
+    if (_currentPage >= _pages.count) _currentPage = _pages.count - 1;
+
     NSRange range = [_pages[_currentPage] rangeValue];
     NSString *sub = [_fullText substringWithRange:range];
     
-    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
-    style.lineSpacing = 8;
-    
     NSDictionary *attr = @{
-        NSFontAttributeName: [NSFont systemFontOfSize:22],
+        NSFontAttributeName: [NSFont systemFontOfSize:24],
         NSForegroundColorAttributeName: [NSColor colorWithDeviceWhite:0.1 alpha:1.0],
-        NSParagraphStyleAttributeName: style
+        NSParagraphStyleAttributeName: [self paragraphStyle]
     };
     
     [[_textView textStorage] setAttributedString:[[NSAttributedString alloc] initWithString:sub attributes:attr]];
-    
-    // 重置滚动条位置到顶部（防止翻页后停留在底部）
     [_textView scrollToBeginningOfDocument:nil];
-    
-    [self setTitle:[NSString stringWithFormat:@"Metal Reader - 第 %ld/%ld 页 (PgUp/PgDn 翻页)", _currentPage + 1, _pages.count]];
     [_mtkView setNeedsDisplay:YES];
 }
 
-- (void)windowDidResize:(NSNotification *)notification {
+// 全屏状态改变后的处理
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    [self paginate];
+    [self updateContent];
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)notification {
     [self paginate];
     [self updateContent];
 }
@@ -230,23 +233,27 @@ kernel void bg_kernel(texture2d<float, access::write> tex [[texture(0)]], uint2 
 
 @end
 
-// --- 程序入口 ---
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         
+        // 禁用 macOS 的窗口状态持久化
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"NSQuitAlwaysKeepsWindows"];
+
         NSString *txt = @"(无内容)";
         if (argc > 1) {
             NSString *path = [NSString stringWithUTF8String:argv[1]];
             txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
             if (!txt) txt = [NSString stringWithContentsOfFile:path encoding:0x80000632 error:nil];
-        } else {
-            txt = @"请提供 TXT 文件路径。\n\n按键盘上的 Page Up 和 Page Down 键进行翻页。";
         }
         
         ReaderWindow *win = [[ReaderWindow alloc] initWithText:txt];
         [win makeKeyAndOrderFront:nil];
+        
+        // 立即全屏
+        [win toggleFullScreen:nil];
+        
         [app activateIgnoringOtherApps:YES];
         [app run];
     }
