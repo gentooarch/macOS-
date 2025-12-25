@@ -5,19 +5,87 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 // --- 自定义 PDF 视图控制器 ---
-@interface MyPDFView : PDFView
+@interface MyPDFView : PDFView {
+    NSMutableString *_inputBuffer; // 用于存储输入的页码数字
+}
 @end
 
 @implementation MyPDFView
-// 如果需要自定义键盘快捷键，可以在这里重写
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        _inputBuffer = [NSMutableString string];
+    }
+    return self;
+}
+
+// 处理键盘事件
 - (void)keyDown:(NSEvent *)event {
+    NSString *chars = [event charactersIgnoringModifiers];
     uint16_t keyCode = [event keyCode];
-    if (keyCode == 49) { // 空格翻页
+
+    // 1. 'q' 键退出
+    if ([chars isEqualToString:@"q"]) {
+        [NSApp terminate:nil];
+        return;
+    }
+
+    // 2. 空格键翻页 (保留原逻辑)
+    if (keyCode == 49) {
         [self scrollPageDown:nil];
-    } else {
-        [super keyDown:event];
+        [_inputBuffer setString:@""]; // 按其他功能键时清空数字缓冲区
+        return;
+    }
+
+    // 3. 数字键处理 (0-9)
+    if (chars.length > 0) {
+        unichar c = [chars characterAtIndex:0];
+        if (c >= '0' && c <= '9') {
+            [_inputBuffer appendString:chars];
+            return;
+        }
+    }
+
+    // 4. 'g' 键跳转
+    if ([chars isEqualToString:@"g"]) {
+        if (_inputBuffer.length > 0) {
+            NSInteger pageNum = [_inputBuffer integerValue];
+            [self jumpToPage:pageNum];
+            [_inputBuffer setString:@""]; // 跳转后清空缓冲区
+        } else {
+            // 如果直接按 g，通常 MuPDF 是回到第一页
+            [self jumpToPage:1];
+        }
+        return;
+    }
+
+    // 如果按了其他非功能键，清空缓冲区防止误触
+    if (chars.length > 0) {
+        [_inputBuffer setString:@""];
+    }
+
+    [super keyDown:event];
+}
+
+// 执行跳转逻辑
+- (void)jumpToPage:(NSInteger)pageNumber {
+    PDFDocument *doc = self.document;
+    if (!doc) return;
+
+    // PDFKit 的索引从 0 开始，用户输入通常从 1 开始
+    NSInteger targetIndex = pageNumber - 1;
+    
+    // 边界检查
+    if (targetIndex < 0) targetIndex = 0;
+    if (targetIndex >= doc.pageCount) targetIndex = doc.pageCount - 1;
+
+    PDFPage *targetPage = [doc pageAtIndex:targetIndex];
+    if (targetPage) {
+        [self goToPage:targetPage];
     }
 }
+
 @end
 
 // --- 应用程序代理 ---
@@ -40,26 +108,20 @@
     [self.window setTitle:@"MiniPDF - Text Interactive"];
     [self.window setDelegate:self];
 
-    // 2. 初始化 PDFView (PDFKit 核心类)
+    // 2. 初始化 MyPDFView
     self.pdfView = [[MyPDFView alloc] initWithFrame:[self.window contentView].bounds];
     
-    // --- 核心设置：开启文字交互和适配 ---
-    self.pdfView.autoScales = YES;                          // 自动缩放
-    self.pdfView.displayMode = kPDFDisplaySinglePageContinuous; // 连续滚动模式（最适合按宽度阅读）
+    self.pdfView.autoScales = YES;
+    self.pdfView.displayMode = kPDFDisplaySinglePageContinuous;
     self.pdfView.displayDirection = kPDFDisplayDirectionVertical;
     self.pdfView.displaysPageBreaks = YES;
     [self.pdfView setDisplaysAsBook:NO];
-    
-    // 设置背景色
     self.pdfView.backgroundColor = [NSColor darkGrayColor];
-    
-    // 允许文字选择 (PDFView 默认开启)
-    // 用户可以直接用鼠标划选文字，Cmd+C 复制
     
     [self.pdfView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [self.window setContentView:self.pdfView];
 
-    // 3. 全屏启动逻辑
+    // 3. 全屏启动
     [self.window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [self.window makeKeyAndOrderFront:nil];
     [self.window toggleFullScreen:nil];
@@ -67,7 +129,7 @@
     [self.window makeFirstResponder:self.pdfView];
     [NSApp activateIgnoringOtherApps:YES];
 
-    // 4. 加载文件逻辑
+    // 4. 加载文件
     NSArray *args = [[NSProcessInfo processInfo] arguments];
     if (args.count > 1) {
         [self loadPDFAtPath:args[1]];
@@ -85,16 +147,10 @@
     PDFDocument *document = [[PDFDocument alloc] initWithURL:url];
     if (document) {
         self.pdfView.document = document;
-        // 强制执行一次“适配宽度”
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [self.pdfView setAutoScales:YES];
         });
     }
-}
-
-// 窗口大小改变时，PDFKit 的 autoScales 会自动处理宽度适配
-- (void)windowDidResize:(NSNotification *)notification {
-    // PDFKit 会自动处理大部分缩放逻辑
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
