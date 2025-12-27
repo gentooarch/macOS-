@@ -3,9 +3,9 @@
  运行环境: macOS 15.0+ (Sequoia)
  优化目标: 
  1. 风格一致性：You 和 Gemini 标签颜色统一。
- 2. 视觉降噪：Send 按钮改为常规颜色（不再是刺眼的系统蓝色）。
- 3. 零磁盘缓存：所有数据驻留内存，不产生物理日志或缓存。
- 4. 低功耗渲染：基于 Metal 的 NSVisualEffectView。
+ 2. 视觉降噪：Send 按钮改为常规颜色。
+ 3. 零磁盘缓存：所有数据驻留内存。
+ 4. 立即全屏：启动即进入 Full Screen 模式。
  编译命令: 
  clang++ -O3 -flto -fobjc-arc -framework Cocoa -framework Foundation -framework QuartzCore -framework UniformTypeIdentifiers main.mm -o GeminiApp
  ===========================================================================
@@ -19,12 +19,12 @@
 // ==========================================
 // 1. 全局配置
 // ==========================================
-static NSString *g_apiKey = @"AIzaSyBH1bzgRhH884iJBUnIVFOS2RwUr-DJD2c"; 
+static NSString *g_apiKey = @"key"; 
 const BOOL USE_PROXY = NO;
 NSString *const PROXY_HOST = @"127.0.0.1";
 const int PROXY_PORT = 7890; 
 // 使用最新稳定版模型
-NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
+NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=";
 
 // ==========================================
 // 2. 核心 UI 控制器
@@ -50,6 +50,9 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     window.backgroundColor = [NSColor clearColor]; 
     window.hasShadow = YES;
     window.releasedWhenClosed = YES;
+    
+    // [新增] 设置全屏行为，允许窗口成为全屏主窗口
+    window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
     
     // [内存优化] 彻底禁用窗口状态自动保存到磁盘
     window.restorable = NO;
@@ -119,7 +122,7 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     
     CGFloat bottomPos = 30;
     
-    // Send 按钮：取消 keyEquivalent 以免变成刺眼的系统蓝色，通过 textField 的 action 触发发送
+    // Send 按钮
     self.sendButton = [NSButton buttonWithTitle:@"Send" target:self action:@selector(onSendClicked)];
     self.sendButton.bezelStyle = NSBezelStyleRounded;
     self.sendButton.frame = NSMakeRect(NSWidth(containerView.bounds) - 100, bottomPos, 80, 32);
@@ -140,7 +143,7 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     upBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [vibrantView addSubview:upBtn];
     
-    // 输入框：保留回车发送逻辑
+    // 输入框
     self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(20, bottomPos, NSWidth(containerView.bounds) - 295, 32)];
     self.inputField.placeholderString = @"Ask Gemini (No-Disk Mode)...";
     self.inputField.font = [NSFont systemFontOfSize:14];
@@ -157,7 +160,6 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
         NSColor *textColor = [NSColor labelColor];
         NSFont *font = isHeader ? [NSFont boldSystemFontOfSize:15] : [NSFont systemFontOfSize:15];
         
-        // 风格统一：不再区分 You 和 Gemini 的颜色，均使用标准的 labelColor
         NSDictionary *attrs = @{ NSForegroundColorAttributeName: textColor, NSFontAttributeName: font };
         NSString *displayStr = isHeader ? [NSString stringWithFormat:@"%@\n", role] : [NSString stringWithFormat:@"%@\n\n", text];
         
@@ -235,7 +237,6 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 
 - (void)onUploadClicked {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    // 适配 macOS 15 的 UTType API
     panel.allowedContentTypes = @[UTTypePlainText, UTTypeSourceCode, UTTypeJSON, UTTypeXML];
     panel.allowsMultipleSelection = NO;
     panel.canChooseDirectories = NO;
@@ -265,12 +266,18 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)a {
-    // 强制关闭 macOS 系统的状态恢复（不把输入内容保存到磁盘）
+    // 强制关闭 macOS 系统的状态恢复
     [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"NSQuitAlwaysKeepsWindows"];
     
     [self setupMenuBar];
     self.mwc = [[MainWindowController alloc] init];
+    
+    // 1. 显示窗口
     [self.mwc showWindow:nil];
+    
+    // 2. [新增] 立即触全屏
+    [self.mwc.window toggleFullScreen:nil];
+    
     [NSApp activateIgnoringOtherApps:YES];
 }
 
@@ -283,7 +290,7 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     [appMenu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
     [appMenuItem setSubmenu:appMenu];
     
-    // Edit Menu (支持 Cmd+C/V/A)
+    // Edit Menu
     NSMenuItem *editMenuItem = [mainMenu addItemWithTitle:@"Edit" action:nil keyEquivalent:@""];
     NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
@@ -291,17 +298,21 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
     [editMenuItem setSubmenu:editMenu];
     
+    // [可选] View Menu，增加全屏快捷键支持
+    NSMenuItem *viewMenuItem = [mainMenu addItemWithTitle:@"View" action:nil keyEquivalent:@""];
+    NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    [viewMenu addItemWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+    [viewMenuItem setSubmenu:viewMenu];
+    
     [NSApp setMainMenu:mainMenu];
 }
 
-// 确保不恢复之前的窗口状态
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app { return NO; }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
 @end
 
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
-        // 支持从命令行参数传入 API Key
         if (argc > 1) g_apiKey = [NSString stringWithUTF8String:argv[1]];
         
         NSApplication *app = [NSApplication sharedApplication];
