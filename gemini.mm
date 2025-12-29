@@ -24,7 +24,7 @@ const BOOL USE_PROXY = NO;
 NSString *const PROXY_HOST = @"127.0.0.1";
 const int PROXY_PORT = 7890; 
 // 使用最新稳定版模型
-NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=";
+NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
 
 // ==========================================
 // 2. 核心 UI 控制器
