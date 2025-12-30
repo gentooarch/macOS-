@@ -12,10 +12,9 @@ class ChatViewModel {
     var isLowPowerMode: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
     
     init() {
-        // 使用 Swift 中最稳健的通知路径
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name.NSProcessInfoPowerStateDidChange,
-            object: nil, 
+            object: nil,
             queue: .main
         ) { [weak self] _ in
             self?.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
@@ -43,7 +42,8 @@ class ChatViewModel {
             isSending = true
         }
         
-        let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=\(apiKey)"
+        // 注意：此处模型名称可能随时间变化，确保使用有效的 Gemini 模型名称
+        let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=\(apiKey)"
         guard let url = URL(string: endpoint) else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -58,6 +58,9 @@ class ChatViewModel {
                     chatHistory.append(ChatMessage(role: "model", parts: [ChatPart(text: modelText)]))
                     saveHistory()
                 }
+            } else {
+                // 简单的错误打印，方便调试
+                if let jsonStr = String(data: data, encoding: .utf8) { print("Error Response: \(jsonStr)") }
             }
         } catch { print(error) }
         await MainActor.run { isSending = false }
@@ -89,30 +92,47 @@ struct ContentView: View {
                     LazyVStack(alignment: .leading, spacing: 24) {
                         ForEach(viewModel.chatHistory) { msg in
                             VStack(alignment: .leading, spacing: 8) {
-                                Text(msg.role == "user" ? "You" : "Gemini").font(.system(size: 13, weight: .bold)).foregroundColor(.secondary)
-                                Text(msg.parts.first?.text ?? "").font(.system(size: 16)).lineSpacing(6)
+                                Text(msg.role == "user" ? "You" : "Gemini")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundColor(.secondary)
+                                
+                                // 核心修改：确保这里允许文本选择
+                                Text(msg.parts.first?.text ?? "")
+                                    .font(.system(size: 16))
+                                    .lineSpacing(6)
                                     .foregroundColor(msg.role == "user" ? .primary : Color(red: 0.12, green: 0.28, blue: 0.45))
-                                    .textSelection(.enabled)
-                            }.id(msg.id)
+                                    .textSelection(.enabled) // 允许鼠标拖拽选择
+                            }
+                            .id(msg.id)
                         }
-                    }.padding(30)
+                    }
+                    .padding(30)
                 }
-                .onChange(of: viewModel.chatHistory.count) { proxy.scrollTo(viewModel.chatHistory.last?.id) }
+                .onChange(of: viewModel.chatHistory.count) {
+                    proxy.scrollTo(viewModel.chatHistory.last?.id)
+                }
             }
             
             HStack(spacing: 12) {
-                TextField("Ask Gemini...", text: $inputText).textFieldStyle(.roundedBorder)
-                    .onSubmit { sendMessage() }.disabled(viewModel.isSending)
+                // 这里的输入框现在支持 Command+V 了，因为我们添加了 Edit 菜单
+                TextField("Ask Gemini...", text: $inputText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { sendMessage() }
+                    .disabled(viewModel.isSending)
+                
                 Button(action: sendMessage) {
                     if viewModel.isSending { ProgressView().controlSize(.small) } else { Text("Send") }
-                }.buttonStyle(.borderedProminent)
-            }.padding()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding()
             .background {
                 if viewModel.isLowPowerMode { paperColor } else { Rectangle().fill(.ultraThinMaterial) }
             }
         }
         .background(paperColor)
     }
+    
     func sendMessage() {
         let text = inputText; guard !text.isEmpty else { return }; inputText = ""
         Task { await viewModel.sendToGemini(text: text) }
@@ -125,6 +145,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var viewModel = ChatViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 1. 设置主菜单（修复复制/粘贴的关键步骤）
+        setupMenu()
+        
         if CommandLine.arguments.count > 1 { viewModel.apiKey = CommandLine.arguments[1] }
         viewModel.loadHistory()
 
@@ -139,6 +162,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         
         NSApp.activate(ignoringOtherApps: true)
+    }
+    
+    // 手动创建 macOS 菜单栏
+    func setupMenu() {
+        let mainMenu = NSMenu()
+        
+        // App 菜单 (Application Name)
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenuItem.submenu = appMenu
+        appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        
+        // Edit 菜单 (这是让 Cmd+C / Cmd+V / Cmd+A 生效的关键)
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenuItem.submenu = editMenu
+        
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        
+        // Window 菜单 (可选，用于全屏等操作)
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenuItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        
+        NSApp.mainMenu = mainMenu
     }
     
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { return true }
