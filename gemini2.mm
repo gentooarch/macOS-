@@ -26,16 +26,16 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
 #define LINE_HEIGHT_MULT 1.25  // 1.25倍行高，增加呼吸感
 
 // --- 护眼浅色配色方案 ---
-// 用户：深海蓝，沉稳清晰
-#define COLOR_USER   [NSColor colorWithSRGBRed:0.05 green:0.25 blue:0.45 alpha:1.0]
+// 用户：墨灰
+#define COLOR_USER   [NSColor colorWithSRGBRed:0.15 green:0.15 blue:0.15 alpha:1.0]
 // 模型：墨灰 (避免纯黑#000000带来的强烈反差)
 #define COLOR_MODEL  [NSColor colorWithSRGBRed:0.15 green:0.15 blue:0.15 alpha:1.0]
 // 思考：暖灰色
 #define COLOR_THINK  [NSColor colorWithSRGBRed:0.55 green:0.55 blue:0.53 alpha:1.0]
 // 系统：次级标签色
 #define COLOR_SYSTEM [NSColor secondaryLabelColor]
-// 错误：柔和红
-#define COLOR_ERROR  [NSColor systemRedColor]
+// 错误：墨灰
+#define COLOR_ERROR  [NSColor colorWithSRGBRed:0.15 green:0.15 blue:0.15 alpha:1.0]
 
 // ==========================================
 // 2. ChatWindowController (核心逻辑)
