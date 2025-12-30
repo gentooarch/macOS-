@@ -1,21 +1,13 @@
-//swiftc -parse-as-library Gemini.swift -o Gemini 
+//swiftc -parse-as-library Gemini.swift -o Gemini
 /*
  ===========================================================================
- Gemini macOS Client (Swift Version)
- Eye-Care Light Theme & Paper-like Mode
+ Gemini macOS Client (Swift Version) - High Performance Edition
  
- [功能特点]
- 1. 启动即全屏：沉浸式阅读体验
- 2. 护眼模式：暖白/羊皮纸背景，低对比度文字
- 3. TextKit 2：高性能文本渲染
- 4. 历史记录：自动保存聊天记录到 /tmp
- 5. 现代并发：使用 Swift Concurrency (async/await)
- 
- [编译命令]
- swiftc Gemini.swift -o Gemini
- 
- [运行命令]
- ./Gemini "你的_API_KEY"
+ [优化点]
+ 1. 异步 I/O：文件保存移至后台线程，不再阻塞 UI
+ 2. GPU 加速：开启 Layer Backing，降低滚动时的 CPU 消耗
+ 3. 懒加载布局：移除强制全局重排版，利用 TextKit 2 惰性计算
+ 4. 内存保护：限制历史记录上下文长度
  ===========================================================================
  */
 
@@ -30,7 +22,11 @@ import Foundation
 struct AppConfig {
     static var apiKey: String = "YOUR_API_KEY_HERE"
     static let historyFilePath = "/tmp/gemini_chat_history_swift.json"
-    static let modelEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key="
+    // 使用 flash 模型以获得更快速度
+    static let modelEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key="
+    
+    // [优化] 最大上下文保留条数，防止 JSON 膨胀导致 I/O 缓慢
+    static let maxHistoryMessages = 50 
     
     struct Fonts {
         static let text = NSFont.systemFont(ofSize: 16.0)
@@ -39,27 +35,22 @@ struct AppConfig {
     }
     
     struct Colors {
-        // 背景：暖白/羊皮纸色 (Hex: #FAF9F6)
         static let paperBackground = NSColor(srgbRed: 0.98, green: 0.976, blue: 0.965, alpha: 1.0)
-        // 用户：深灰
         static let user = NSColor(srgbRed: 0.20, green: 0.20, blue: 0.20, alpha: 1.0)
-        // 模型：深蓝灰
         static let model = NSColor(srgbRed: 0.17, green: 0.24, blue: 0.31, alpha: 1.0)
-        // 思考过程
         static let thought = NSColor(srgbRed: 0.50, green: 0.55, blue: 0.55, alpha: 1.0)
-        // 系统/错误
         static let system = NSColor(srgbRed: 0.60, green: 0.60, blue: 0.60, alpha: 1.0)
         static let error = NSColor(srgbRed: 0.75, green: 0.22, blue: 0.17, alpha: 1.0)
     }
 }
 
 // ==========================================
-// 2. 数据模型 (Codable)
+// 2. 数据模型
 // ==========================================
 
 struct ChatPart: Codable {
     let text: String?
-    let thought: String? // Gemini 2.0 Thinking logic placeholder
+    let thought: String?
 }
 
 struct ChatMessage: Codable {
@@ -74,7 +65,7 @@ struct APIRequest: Codable {
 struct APIResponse: Codable {
     struct Candidate: Codable {
         struct Content: Codable {
-            let parts: [ChatPart]
+            let parts: [ChatPart]?
         }
         let content: Content
     }
@@ -92,34 +83,33 @@ struct APIResponse: Codable {
 
 class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
     
-    // TextKit 2 Components
     private var textView: NSTextView!
     private var textContentStorage: NSTextContentStorage!
     private var textLayoutManager: NSTextLayoutManager!
     private var textContainer: NSTextContainer!
     
-    // UI Components
     private var inputField: NSTextField!
     private var sendButton: NSButton!
     private var effectView: NSVisualEffectView!
     
-    // Data
     private var chatHistory: [ChatMessage] = []
+    
+    // [优化] 用于后台保存文件的串行队列，防止写入冲突
+    private let ioQueue = DispatchQueue(label: "com.gemini.ioQueue", qos: .background)
     
     init() {
         let frame = NSRect(x: 0, y: 0, width: 1000, height: 800)
         let style: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView]
         
         let window = NSWindow(contentRect: frame, styleMask: style, backing: .buffered, defer: false)
-        window.title = "Gemini Reader (Swift)"
+        window.title = "Gemini Reader (Optimized)"
         window.minSize = NSSize(width: 600, height: 500)
         window.collectionBehavior = .fullScreenPrimary
         
-        // 透明化基础设置
         window.isOpaque = false
         window.backgroundColor = .clear
         window.titlebarAppearsTransparent = true
-        window.appearance = NSAppearance(named: .aqua) // 强制浅色以配合纸张主题
+        window.appearance = NSAppearance(named: .aqua)
         
         super.init(window: window)
         
@@ -135,26 +125,29 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
         guard let window = self.window, let contentView = window.contentView else { return }
         let bounds = contentView.bounds
         
-        // 1. 背景层：毛玻璃 + 暖色滤镜
+        // 1. 背景层
         effectView = NSVisualEffectView(frame: bounds)
         effectView.autoresizingMask = [.width, .height]
         effectView.material = .underPageBackground
         effectView.blendingMode = .behindWindow
         effectView.state = .active
+        // [优化] 开启 Layer，减少重绘
+        effectView.wantsLayer = true
         window.contentView = effectView
         
         let tintView = NSView(frame: bounds)
         tintView.autoresizingMask = [.width, .height]
         tintView.wantsLayer = true
-        // 0.85 的透明度：透出一点点背景模糊
         tintView.layer?.backgroundColor = AppConfig.Colors.paperBackground.withAlphaComponent(0.85).cgColor
         effectView.addSubview(tintView)
         
-        // 2. 文本区域 (TextKit 2)
+        // 2. 文本区域
         let scrollView = NSScrollView(frame: NSRect(x: 30, y: 80, width: bounds.width - 60, height: bounds.height - 110))
         scrollView.hasVerticalScroller = true
         scrollView.autoresizingMask = [.width, .height]
-        scrollView.drawsBackground = false // 透明
+        scrollView.drawsBackground = false
+        // [优化] 关键：开启 ScrollView 的 Layer Backing，大幅降低滚动 CPU 占用
+        scrollView.wantsLayer = true
         
         textContentStorage = NSTextContentStorage()
         textLayoutManager = NSTextLayoutManager()
@@ -175,12 +168,14 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
         textView.isSelectable = true
         textView.textContainerInset = NSSize(width: 10, height: 20)
         textView.font = AppConfig.Fonts.text
-        textView.drawsBackground = false // 关键：透明
+        textView.drawsBackground = false
+        // [优化] 开启 TextView 的 Layer Backing
+        textView.wantsLayer = true
         
         scrollView.documentView = textView
         effectView.addSubview(scrollView)
         
-        // 3. 底部输入区
+        // 3. 底部 UI
         let bottomY: CGFloat = 30
         let buttonHeight: CGFloat = 32
         
@@ -191,7 +186,7 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
         inputField.delegate = self
         inputField.target = self
         inputField.action = #selector(onEnterPressed)
-        inputField.autoresizingMask = [.width, .maxYMargin] // 随宽度调整
+        inputField.autoresizingMask = [.width, .maxYMargin]
         inputField.wantsLayer = true
         inputField.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.6).cgColor
         effectView.addSubview(inputField)
@@ -242,18 +237,23 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
     @objc private func onUploadClicked() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
-        panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.plainText, .sourceCode, .json, .xml, .html]
         
         panel.beginSheetModal(for: self.window!) { response in
             if response == .OK, let url = panel.urls.first {
-                do {
-                    let content = try String(contentsOf: url, encoding: .utf8)
-                    let msg = "[File Upload: \(url.lastPathComponent)]\n\n\(content)"
-                    self.processUserMessage(msg)
-                } catch {
-                    self.appendLog(header: "[Error]", content: error.localizedDescription, color: AppConfig.Colors.error)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let content = try String(contentsOf: url, encoding: .utf8)
+                        let msg = "[File Upload: \(url.lastPathComponent)]\n\n\(content)"
+                        DispatchQueue.main.async {
+                            self.processUserMessage(msg)
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            self.appendLog(header: "[Error]", content: error.localizedDescription, color: AppConfig.Colors.error)
+                        }
+                    }
                 }
             }
         }
@@ -261,9 +261,8 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
     
     @objc private func onClearClicked() {
         chatHistory.removeAll()
-        saveHistoryToDisk()
+        saveHistoryInBackground() // [优化] 异步清空
         
-        // 清空 UI
         textContentStorage.performEditingTransaction {
             textContentStorage.textStorage?.deleteCharacters(in: NSRange(location: 0, length: textContentStorage.textStorage!.length))
         }
@@ -275,13 +274,15 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
         
         let userMsg = ChatMessage(role: "user", parts: [ChatPart(text: text, thought: nil)])
         chatHistory.append(userMsg)
-        saveHistoryToDisk()
+        
+        // [优化] 不要在主线程保存
+        saveHistoryInBackground()
         
         callGeminiAPI()
     }
     
     // ==========================================
-    // API 网络请求 (Swift Concurrency)
+    // API 网络请求
     // ==========================================
     
     private func callGeminiAPI() {
@@ -289,7 +290,9 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
         
         Task {
             do {
-                let response = try await fetchGeminiResponse(history: chatHistory)
+                // [优化] 发送请求时只带上最近的 N 条记录，减少 token 消耗和上下文超长错误
+                let contextHistory = Array(chatHistory.suffix(AppConfig.maxHistoryMessages))
+                let response = try await fetchGeminiResponse(history: contextHistory)
                 
                 await MainActor.run {
                     self.handleAPIResponse(response)
@@ -327,27 +330,32 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
         }
         
         guard let candidate = response.candidates?.first,
-              let parts = Optional(candidate.content.parts), !parts.isEmpty else {
+              let parts = candidate.content.parts, !parts.isEmpty else {
             return
         }
         
         var fullText = ""
+        var fullThought = ""
         
         for part in parts {
             if let thought = part.thought {
-                appendLog(header: "Thinking", content: thought, color: AppConfig.Colors.thought)
+                fullThought += thought + "\n"
             }
             if let text = part.text {
                 fullText += text
             }
         }
         
+        if !fullThought.isEmpty {
+            appendLog(header: "Thinking", content: fullThought.trimmingCharacters(in: .whitespacesAndNewlines), color: AppConfig.Colors.thought)
+        }
+        
         if !fullText.isEmpty {
             appendLog(header: "Gemini", content: fullText, color: AppConfig.Colors.model)
             
-            let modelMsg = ChatMessage(role: "model", parts: [ChatPart(text: fullText, thought: nil)])
+            let modelMsg = ChatMessage(role: "model", parts: [ChatPart(text: fullText, thought: fullThought.isEmpty ? nil : fullThought)])
             chatHistory.append(modelMsg)
-            saveHistoryToDisk()
+            saveHistoryInBackground() // [优化] 异步保存
         }
     }
     
@@ -356,45 +364,40 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
     // ==========================================
     
     private func appendLog(header: String, content: String, color: NSColor) {
+        // [优化] 预先创建属性字典，减少 transaction 内部计算量
         let paraStyle = NSMutableParagraphStyle()
         paraStyle.lineBreakMode = .byWordWrapping
         paraStyle.lineHeightMultiple = AppConfig.Fonts.lineHeightMult
         
-        let mas = NSMutableAttributedString()
-        
-        // 标题
         let headerAttrs: [NSAttributedString.Key: Any] = [
             .font: AppConfig.Fonts.header,
             .foregroundColor: color,
             .paragraphStyle: paraStyle
         ]
-        mas.append(NSAttributedString(string: "\(header)\n", attributes: headerAttrs))
         
-        // 内容
         let contentAttrs: [NSAttributedString.Key: Any] = [
             .font: AppConfig.Fonts.text,
             .foregroundColor: color,
             .paragraphStyle: paraStyle
         ]
-        mas.append(NSAttributedString(string: "\(content)\n", attributes: contentAttrs))
         
-        // 空行
-        mas.append(NSAttributedString(string: "\n", attributes: [.paragraphStyle: paraStyle]))
+        let mas = NSMutableAttributedString()
+        mas.append(NSAttributedString(string: "\(header)\n", attributes: headerAttrs))
+        mas.append(NSAttributedString(string: "\(content)\n\n", attributes: contentAttrs)) // 合并空行
         
         textContentStorage.performEditingTransaction {
             textContentStorage.textStorage?.append(mas)
         }
         
+        // [优化] 移除 ensureLayout(for: documentRange)
+        // 那个调用会强制重新计算整个文档的布局，极其消耗 CPU。
+        // 只需让 textView 滚动到可视区域，布局引擎会自动按需计算。
         scrollToBottom()
     }
     
     private func scrollToBottom() {
-        // 确保布局更新
-        textLayoutManager.ensureLayout(for: textContentStorage.documentRange)
-        
         DispatchQueue.main.async {
-            guard let string = self.textView.textStorage?.string, !string.isEmpty else { return }
-            self.textView.scrollRangeToVisible(NSRange(location: string.count, length: 0))
+            self.textView.scrollToEndOfDocument(nil)
         }
     }
     
@@ -404,45 +407,58 @@ class ChatWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDel
     }
     
     // ==========================================
-    // 历史记录
+    // [优化] 历史记录：异步 I/O
     // ==========================================
     
     private func loadHistoryFromDisk() {
+        // 加载通常只需一次，且在启动时，允许在主线程或 userInitiated 队列
         let fileURL = URL(fileURLWithPath: AppConfig.historyFilePath)
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         
-        do {
-            let data = try Data(contentsOf: fileURL)
-            let loadedHistory = try JSONDecoder().decode([ChatMessage].self, from: data)
-            self.chatHistory = loadedHistory
-            
-            appendLog(header: "[System]", content: "Loaded \(loadedHistory.count) messages", color: AppConfig.Colors.system)
-            
-            for msg in loadedHistory {
-                let roleDisplay = msg.role == "user" ? "You" : "Gemini"
-                let color = msg.role == "user" ? AppConfig.Colors.user : AppConfig.Colors.model
-                let text = msg.parts.first?.text ?? ""
-                appendLog(header: roleDisplay, content: text, color: color)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let data = try Data(contentsOf: fileURL)
+                let loadedHistory = try JSONDecoder().decode([ChatMessage].self, from: data)
+                
+                DispatchQueue.main.async {
+                    self.chatHistory = loadedHistory
+                    self.appendLog(header: "[System]", content: "Restored \(loadedHistory.count) messages", color: AppConfig.Colors.system)
+                    
+                    // 仅渲染最后几条，提升启动速度？(这里先保留渲染全部，但可优化)
+                    for msg in loadedHistory {
+                        let roleDisplay = msg.role == "user" ? "You" : "Gemini"
+                        let color = msg.role == "user" ? AppConfig.Colors.user : AppConfig.Colors.model
+                        let text = msg.parts.first?.text ?? ""
+                        self.appendLog(header: roleDisplay, content: text, color: color)
+                    }
+                }
+            } catch {
+                print("Failed to load history: \(error)")
             }
-            scrollToBottom()
-        } catch {
-            print("Failed to load history: \(error)")
         }
     }
     
-    private func saveHistoryToDisk() {
-        let fileURL = URL(fileURLWithPath: AppConfig.historyFilePath)
-        do {
-            let data = try JSONEncoder().encode(chatHistory)
-            try data.write(to: fileURL)
-        } catch {
-            print("Failed to save history: \(error)")
+    private func saveHistoryInBackground() {
+        // [优化] 深拷贝数据以避免多线程访问冲突（Value Type 写时复制特性）
+        let historyToSave = self.chatHistory
+        
+        ioQueue.async {
+            // 只保存最近 N 条，防止文件无限大 (可选)
+            // let subset = historyToSave.suffix(100)
+            
+            let fileURL = URL(fileURLWithPath: AppConfig.historyFilePath)
+            do {
+                let data = try JSONEncoder().encode(historyToSave)
+                try data.write(to: fileURL, options: .atomic)
+            } catch {
+                print("Background save failed: \(error)")
+            }
         }
     }
 }
 
 // ==========================================
-// 4. App Entry (程序入口)
+// 4. App Entry
 // ==========================================
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -450,14 +466,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
-        
         windowController = ChatWindowController()
         windowController.showWindow(self)
-        
         NSApp.activate(ignoringOtherApps: true)
         windowController.window?.makeKeyAndOrderFront(nil)
-        
-        // 触发全屏
         windowController.window?.toggleFullScreen(nil)
     }
     
@@ -469,21 +481,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let mainMenu = NSMenu()
         NSApp.mainMenu = mainMenu
         
-        // App Menu
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "Quit Gemini", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         
-        // Edit Menu (Standard Copy/Paste support)
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
         editMenuItem.submenu = editMenu
-        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
-        editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
@@ -491,15 +498,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// Main Entry
 @main
 struct GeminiApp {
     static func main() {
-        // 读取命令行参数
         if CommandLine.arguments.count > 1 {
             AppConfig.apiKey = CommandLine.arguments[1]
         }
-        
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
         let delegate = AppDelegate()
