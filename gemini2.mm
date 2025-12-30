@@ -25,7 +25,7 @@
 static NSString *g_apiKey = @"key";
 static NSString *const kHistoryFilePath = @"/tmp/gemini_chat_history.json";
 // 注意：模型名称可能会随时间更新，请根据 Google AI Studio 最新文档调整
-static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=";
+static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
 
 // --- 字体与排版配置 ---
 #define FONT_SIZE_TEXT   16.0  // 正文 16pt，适合阅读
