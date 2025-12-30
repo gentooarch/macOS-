@@ -23,7 +23,7 @@ struct AppConfig {
     static var apiKey: String = "YOUR_API_KEY_HERE"
     static let historyFilePath = "/tmp/gemini_chat_history_swift.json"
     // 使用 flash 模型以获得更快速度
-    static let modelEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key="
+    static let modelEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key="
     
     // [优化] 最大上下文保留条数，防止 JSON 膨胀导致 I/O 缓慢
     static let maxHistoryMessages = 50 
