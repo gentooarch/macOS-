@@ -1,356 +1,460 @@
 /*
  ===========================================================================
- 运行环境: macOS 15.0+ (Sequoia)
- 优化目标: 
- 1. [低功耗] TextKit 懒加载布局 (allowsNonContiguousLayout).
- 2. [低功耗] JSON 解析移至后台线程.
- 3. [低功耗] 移除废弃的 copiesOnScroll (系统自动优化).
- 4. [低功耗] 编译级指令集优化 (-march=native).
- clang++ -O3 -flto -march=native -fobjc-arc -framework Cocoa -framework Foundation -framework QuartzCore -framework UniformTypeIdentifiers main.mm -o GeminiApp
- 5. 零磁盘缓存 & 立即全屏.
+ Gemini macOS Client (Light Theme & Readability Optimized)
+ 
+ 编译命令:
+ clang++ -O3 -fobjc-arc -framework Cocoa -framework Foundation -framework UniformTypeIdentifiers main.mm -o Gemini
+ 
+ 运行命令:
+ ./Gemini "你的_API_KEY"
  ===========================================================================
  */
 
 #import <Cocoa/Cocoa.h>
-#import <Foundation/Foundation.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
-#import <QuartzCore/QuartzCore.h>
 
 // ==========================================
-// 1. 全局配置
+// 1. 全局配置与常量
 // ==========================================
 static NSString *g_apiKey = @"key";
-const BOOL USE_PROXY = NO;
-NSString *const PROXY_HOST = @"127.0.0.1";
-const int PROXY_PORT = 7890;
-NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
+static NSString *const kHistoryFilePath = @"/tmp/gemini_chat_history.json";
+static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
 
-// [极致省电开关]
-// 设置为 YES: 移除毛玻璃背景，使用纯色背景，窗口设为不透明。极大降低 GPU 渲染压力。
-// 设置为 NO:  保持原本的毛玻璃美观效果。
-const BOOL kLowPowerMode = NO; 
+// --- 字体与排版配置 ---
+#define FONT_SIZE_TEXT   16.0  // 正文增大至16，适合阅读
+#define FONT_SIZE_HEADER 16.0  // 标题字号
+#define LINE_HEIGHT_MULT 1.25  // 1.25倍行高，增加呼吸感
+
+// --- 护眼浅色配色方案 ---
+// 用户：深海蓝，沉稳清晰
+#define COLOR_USER   [NSColor colorWithSRGBRed:0.05 green:0.25 blue:0.45 alpha:1.0]
+// 模型：墨灰 (避免纯黑#000000带来的强烈反差)
+#define COLOR_MODEL  [NSColor colorWithSRGBRed:0.15 green:0.15 blue:0.15 alpha:1.0]
+// 思考：暖灰色
+#define COLOR_THINK  [NSColor colorWithSRGBRed:0.55 green:0.55 blue:0.53 alpha:1.0]
+// 系统：次级标签色
+#define COLOR_SYSTEM [NSColor secondaryLabelColor]
+// 错误：柔和红
+#define COLOR_ERROR  [NSColor systemRedColor]
 
 // ==========================================
-// 2. 核心 UI 控制器
+// 2. ChatWindowController (核心逻辑)
 // ==========================================
-@interface MainWindowController : NSWindowController <NSWindowDelegate, NSTextFieldDelegate>
+@interface ChatWindowController : NSWindowController <NSWindowDelegate, NSTextFieldDelegate>
+
+// TextKit 2 组件
+@property (strong) NSTextView *textView;
+@property (strong) NSTextContentStorage *textContentStorage;
+@property (strong) NSTextLayoutManager *textLayoutManager;
+@property (strong) NSTextContainer *textContainer;
+
+// 逻辑组件
 @property (strong) NSMutableArray<NSDictionary *> *chatHistory;
-@property (strong) NSTextView *outputTextView;
 @property (strong) NSTextField *inputField;
 @property (strong) NSButton *sendButton;
-@property (strong) NSURLSession *session;
-@property (strong) id activityToken;
+
+// 背景特效视图
+@property (strong) NSVisualEffectView *effectView;
+
 @end
 
-@implementation MainWindowController
+@implementation ChatWindowController
 
 - (instancetype)init {
-    NSRect frame = NSMakeRect(0, 0, 900, 720);
-    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView;
+    // 1. 创建窗口框架
+    NSRect frame = NSMakeRect(0, 0, 950, 750); //稍微加大窗口默认尺寸
+    
+    NSUInteger style = NSWindowStyleMaskTitled |
+                       NSWindowStyleMaskClosable |
+                       NSWindowStyleMaskResizable |
+                       NSWindowStyleMaskMiniaturizable |
+                       NSWindowStyleMaskFullSizeContentView;
     
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    window.title = @"Gemini RAM-Only";
+    
+    // 2. 窗口设置
+    window.title = @"Gemini Reader";
+    window.minSize = NSMakeSize(600, 400);
+    window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+    
+    // 透明化基础设置
+    window.opaque = NO;
+    window.backgroundColor = [NSColor clearColor];
     window.titlebarAppearsTransparent = YES;
     
-    // [省电优化] 根据模式决定窗口透明度
-    if (kLowPowerMode) {
-        window.backgroundColor = [NSColor windowBackgroundColor];
-        window.opaque = YES; // 告诉 WindowServer 不需要计算混合，大幅降低全屏时的 GPU 功耗
-        window.hasShadow = NO;
-    } else {
-        window.backgroundColor = [NSColor clearColor];
-        window.opaque = NO;
-        window.hasShadow = YES;
-    }
+    // 关键：强制窗口使用浅色外观 (Aqua)，确保字体和控件在浅色背景下清晰可见
+    window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
     
-    window.releasedWhenClosed = YES;
-    window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
-    window.restorable = NO;
-    window.identifier = nil;
-
     self = [super initWithWindow:window];
     if (self) {
         _chatHistory = [NSMutableArray array];
-        [self setupNetworkSession];
         [self setupUI];
-        window.delegate = self;
+        [self loadHistoryFromDisk]; 
     }
     return self;
 }
 
-- (void)setupNetworkSession {
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    // [内存优化] 限制内存缓存大小，防止无限增长
-    config.URLCache = [[NSURLCache alloc] initWithMemoryCapacity:50 * 1024 * 1024 diskCapacity:0 diskPath:nil];
-    config.HTTPCookieStorage = nil;
-    config.URLCredentialStorage = nil;
-    config.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
-    
-    if (USE_PROXY) {
-        config.connectionProxyDictionary = @{
-            @"HTTPEnable": @YES, @"HTTPProxy": PROXY_HOST, @"HTTPPort": @(PROXY_PORT),
-            @"HTTPSEnable": @YES, @"HTTPSProxy": PROXY_HOST, @"HTTPSPort": @(PROXY_PORT)
-        };
-    }
-    self.session = [NSURLSession sessionWithConfiguration:config];
-}
-
 - (void)setupUI {
-    NSView *containerView = self.window.contentView;
-    containerView.wantsLayer = YES;
+    NSWindow *window = self.window;
+    NSView *rootView = window.contentView;
+    NSRect bounds = rootView.bounds;
 
-    // [省电优化] 仅在非省电模式下加载 VisualEffectView
-    NSView *bgView = containerView;
-    if (!kLowPowerMode) {
-        NSVisualEffectView *vibrantView = [[NSVisualEffectView alloc] initWithFrame:containerView.bounds];
-        vibrantView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        vibrantView.material = NSVisualEffectMaterialUnderWindowBackground;
-        vibrantView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-        vibrantView.state = NSVisualEffectStateActive;
-        [containerView addSubview:vibrantView];
-        bgView = vibrantView;
-    }
-
-    // [省电优化] 滚动视图配置
-    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 100, 860, 560)];
+    // ---------------------------------------------------------
+    // A. 添加 Metal/VisualEffect 毛玻璃背景
+    // ---------------------------------------------------------
+    _effectView = [[NSVisualEffectView alloc] initWithFrame:bounds];
+    _effectView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    
+    // 修改：使用 Sidebar 材质，在浅色模式下呈现为通透的磨砂白/浅灰，非常适合阅读
+    _effectView.material = NSVisualEffectMaterialSidebar;
+    _effectView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    _effectView.state = NSVisualEffectStateActive;
+    
+    window.contentView = _effectView;
+    
+    // ---------------------------------------------------------
+    // B. TextKit 2 初始化栈
+    // ---------------------------------------------------------
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(30, 70, bounds.size.width - 60, bounds.size.height - 100)];
     scrollView.hasVerticalScroller = YES;
-    scrollView.borderType = NSNoBorder;
-    scrollView.drawsBackground = NO;
     scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    scrollView.drawsBackground = NO; // 透明
     
-    // [已修复] 移除了 macOS 11+ 废弃的 copiesOnScroll 属性，系统现在会自动处理最高效的滚动重绘
+    _textContentStorage = [[NSTextContentStorage alloc] init];
+    _textLayoutManager = [[NSTextLayoutManager alloc] init];
+    [_textContentStorage addTextLayoutManager:_textLayoutManager];
     
-    self.outputTextView = [[NSTextView alloc] initWithFrame:scrollView.bounds];
-    self.outputTextView.editable = NO;
-    self.outputTextView.selectable = YES;
-    self.outputTextView.font = [NSFont systemFontOfSize:15];
-    self.outputTextView.textColor = [NSColor labelColor];
-    self.outputTextView.drawsBackground = NO;
-    self.outputTextView.verticallyResizable = YES;
-    self.outputTextView.horizontallyResizable = NO;
-    self.outputTextView.autoresizingMask = NSViewWidthSizable;
-    self.outputTextView.textContainer.widthTracksTextView = YES;
-    self.outputTextView.textContainerInset = NSMakeSize(10, 10);
+    NSSize contentSize = scrollView.contentSize;
+    _textContainer = [[NSTextContainer alloc] initWithSize:NSMakeSize(contentSize.width, FLT_MAX)];
+    _textContainer.widthTracksTextView = YES;
+    _textContainer.heightTracksTextView = NO;
+    _textLayoutManager.textContainer = _textContainer;
     
-    // [关键优化] 允许非连续布局。这对于长文本聊天至关重要，
-    // 它允许系统只计算当前屏幕可见区域的文字布局，而不是重新计算整个历史记录。
-    // 这能将 CPU 占用率降低 80% 以上。
-    self.outputTextView.layoutManager.allowsNonContiguousLayout = YES;
+    _textView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, contentSize.width, contentSize.height) textContainer:_textContainer];
+    _textView.minSize = NSMakeSize(0.0, contentSize.height);
+    _textView.maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+    _textView.verticallyResizable = YES;
+    _textView.horizontallyResizable = NO;
+    _textView.autoresizingMask = NSViewWidthSizable;
+    _textView.editable = NO;
+    _textView.selectable = YES;
+    _textView.textContainerInset = NSMakeSize(10, 20); // 增加顶部留白
+    _textView.font = [NSFont systemFontOfSize:FONT_SIZE_TEXT];
     
-    scrollView.documentView = self.outputTextView;
-    [bgView addSubview:scrollView];
+    _textView.drawsBackground = NO; // 透明
     
-    CGFloat bottomPos = 30;
+    scrollView.documentView = _textView;
+    [_effectView addSubview:scrollView];
     
-    // Buttons
-    self.sendButton = [NSButton buttonWithTitle:@"Send" target:self action:@selector(onSendClicked)];
-    self.sendButton.bezelStyle = NSBezelStyleRounded;
-    self.sendButton.frame = NSMakeRect(NSWidth(containerView.bounds) - 100, bottomPos, 80, 32);
-    self.sendButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [bgView addSubview:self.sendButton];
+    // ---------------------------------------------------------
+    // C. 输入区域
+    // ---------------------------------------------------------
+    CGFloat bottomY = 20;
+    CGFloat buttonHeight = 36; // 稍微加高按钮
+    
+    _inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(30, bottomY, 600, buttonHeight)];
+    _inputField.placeholderString = @"Ask something...";
+    _inputField.font = [NSFont systemFontOfSize:FONT_SIZE_TEXT]; // 输入框字体也加大
+    _inputField.bezelStyle = NSTextFieldRoundedBezel;
+    _inputField.delegate = self;
+    _inputField.target = self;
+    _inputField.action = @selector(onEnterPressed);
+    _inputField.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [_effectView addSubview:_inputField];
+    
+    _sendButton = [NSButton buttonWithTitle:@"Send" target:self action:@selector(onSendClicked)];
+    _sendButton.bezelStyle = NSBezelStyleRounded;
+    _sendButton.frame = NSMakeRect(640, bottomY, 70, buttonHeight);
+    _sendButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    _sendButton.font = [NSFont systemFontOfSize:14]; // 按钮字体适中
+    [_effectView addSubview:_sendButton];
+    
+    NSButton *uploadBtn = [NSButton buttonWithTitle:@"Upload" target:self action:@selector(onUploadClicked)];
+    uploadBtn.bezelStyle = NSBezelStyleRounded;
+    uploadBtn.frame = NSMakeRect(720, bottomY, 80, buttonHeight);
+    uploadBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [_effectView addSubview:uploadBtn];
     
     NSButton *clearBtn = [NSButton buttonWithTitle:@"Clear" target:self action:@selector(onClearClicked)];
     clearBtn.bezelStyle = NSBezelStyleRounded;
-    clearBtn.frame = NSMakeRect(NSWidth(containerView.bounds) - 180, bottomPos, 70, 32);
+    clearBtn.frame = NSMakeRect(810, bottomY, 80, buttonHeight);
     clearBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [bgView addSubview:clearBtn];
-    
-    NSButton *upBtn = [NSButton buttonWithTitle:@"Upload" target:self action:@selector(onUploadClicked)];
-    upBtn.bezelStyle = NSBezelStyleRounded;
-    upBtn.frame = NSMakeRect(NSWidth(containerView.bounds) - 265, bottomPos, 80, 32);
-    upBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [bgView addSubview:upBtn];
-    
-    // Input Field
-    self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(20, bottomPos, NSWidth(containerView.bounds) - 295, 32)];
-    self.inputField.placeholderString = @"Ask Gemini (Low Power Mode)...";
-    self.inputField.font = [NSFont systemFontOfSize:14];
-    self.inputField.bezelStyle = NSTextFieldRoundedBezel;
-    self.inputField.target = self;
-    self.inputField.action = @selector(onSendClicked);
-    self.inputField.delegate = self;
-    self.inputField.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    [bgView addSubview:self.inputField];
+    [_effectView addSubview:clearBtn];
 }
 
-- (void)appendLog:(NSString *)role content:(NSString *)text isHeader:(BOOL)isHeader {
-    // 确保 UI 更新在主线程
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // [内存优化] 简单的属性字符串创建
-        NSColor *textColor = [NSColor labelColor];
-        NSFont *font = isHeader ? [NSFont boldSystemFontOfSize:15] : [NSFont systemFontOfSize:15];
-        
-        NSDictionary *attrs = @{ NSForegroundColorAttributeName: textColor, NSFontAttributeName: font };
-        NSString *displayStr = isHeader ? [NSString stringWithFormat:@"%@\n", role] : [NSString stringWithFormat:@"%@\n\n", text];
-        
-        NSAttributedString *as = [[NSAttributedString alloc] initWithString:displayStr attributes:attrs];
-        
-        NSTextStorage *storage = self.outputTextView.textStorage;
-        [storage beginEditing]; // 批量编辑标记，减少重绘次数
-        [storage appendAttributedString:as];
-        [storage endEditing];
-        
-        [self.outputTextView scrollRangeToVisible:NSMakeRange(storage.length, 0)];
-    });
-}
+// ==========================================
+// 3. 历史记录管理
+// ==========================================
 
-- (void)callGeminiAPI {
-    if (g_apiKey.length < 5 || [g_apiKey containsString:@"YOUR_API"]) {
-        [self appendLog:@"[Error]" content:@"API Key is missing!" isHeader:YES];
-        return;
-    }
-
-    self.sendButton.enabled = NO;
-    // 使用 UserInitiated 优先级，平衡响应速度和能效
-    self.activityToken = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated reason:@"Gemini API Request"];
-
-    NSString *urlString = [MODEL_ENDPOINT stringByAppendingString:g_apiKey];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-    request.HTTPMethod = @"POST";
-    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [request setValue:@"no-store" forHTTPHeaderField:@"Cache-Control"];
-
-    NSDictionary *payload = @{@"contents": self.chatHistory};
-    // [优化] 序列化移出主线程（虽然数据量小影响不大，但为了极致）
-    NSError *jsonError = nil;
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonError];
-    if (jsonError) {
-        [self appendLog:@"[Error]" content:@"JSON Encode Failed" isHeader:YES];
-        self.sendButton.enabled = YES;
-        return;
-    }
-    request.HTTPBody = jsonData;
-
-    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        
-        // [核心优化] 繁重的 JSON 解析工作仍在后台线程完成，不阻塞主线程
-        NSString *responseText = nil;
-        NSString *errorMsg = nil;
-
-        if (error) {
-            errorMsg = error.localizedDescription;
-        } else if (data) {
-            NSError *parseError = nil;
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&parseError];
-            if (json) {
-                @try {
-                    responseText = json[@"candidates"][0][@"content"][@"parts"][0][@"text"];
-                    if (!responseText) errorMsg = @"No content in response.";
-                } @catch (NSException *e) {
-                    errorMsg = @"Failed to parse API structure.";
-                }
-            } else {
-                errorMsg = @"Invalid JSON response.";
+- (void)loadHistoryFromDisk {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:kHistoryFilePath]) return;
+    
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfFile:kHistoryFilePath options:0 error:&error];
+    if (data) {
+        NSArray *jsonArr = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&error];
+        if (jsonArr) {
+            self.chatHistory = [jsonArr mutableCopy];
+            [self appendLog:@"[System]" content:[NSString stringWithFormat:@"Loaded %lu messages", (unsigned long)jsonArr.count] color:COLOR_SYSTEM];
+            
+            for (NSDictionary *msg in self.chatHistory) {
+                NSString *role = msg[@"role"];
+                NSString *text = @"";
+                NSArray *parts = msg[@"parts"];
+                if (parts.count > 0) text = parts[0][@"text"];
+                
+                NSColor *color = [role isEqualToString:@"user"] ? COLOR_USER : COLOR_MODEL;
+                NSString *displayRole = [role isEqualToString:@"user"] ? @"You" : @"Gemini";
+                [self appendLog:displayRole content:text color:color];
             }
+            [self scrollToBottom];
         }
-
-        // 只有在准备好 UI 数据后，才 dispatch 到主线程
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.sendButton.enabled = YES;
-            if (self.activityToken) {
-                [[NSProcessInfo processInfo] endActivity:self.activityToken];
-                self.activityToken = nil;
-            }
-
-            if (responseText) {
-                [self appendLog:@"Gemini:" content:nil isHeader:YES];
-                [self appendLog:nil content:responseText isHeader:NO];
-                [self addToHistoryWithRole:@"model" text:responseText];
-            } else if (errorMsg) {
-                [self appendLog:@"[Error]" content:errorMsg isHeader:YES];
-            }
-        });
-    }];
-    [task resume];
+    }
 }
 
-- (void)addToHistoryWithRole:(NSString *)role text:(NSString *)text {
-    [_chatHistory addObject:@{@"role": role, @"parts": @[@{@"text": text}]}];
+- (void)saveHistoryToDisk {
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:self.chatHistory options:NSJSONWritingPrettyPrinted error:&error];
+    if (data) [data writeToFile:kHistoryFilePath atomically:YES];
 }
 
-- (void)onClearClicked {
-    [_chatHistory removeAllObjects];
-    self.outputTextView.string = @"";
-}
+// ==========================================
+// 4. 核心逻辑与网络
+// ==========================================
+
+- (void)onEnterPressed { [self onSendClicked]; }
 
 - (void)onSendClicked {
-    NSString *prompt = self.inputField.stringValue;
-    if (prompt.length == 0) return;
+    NSString *input = self.inputField.stringValue;
+    if (input.length == 0) return;
     
-    [self appendLog:@"You:" content:nil isHeader:YES];
-    [self appendLog:nil content:prompt isHeader:NO];
+    if ([input isEqualToString:@"/clear"]) {
+        [self onClearClicked];
+        self.inputField.stringValue = @"";
+        return;
+    }
     
-    [self addToHistoryWithRole:@"user" text:prompt];
+    [self processUserMessage:input];
     self.inputField.stringValue = @"";
+}
+
+- (void)processUserMessage:(NSString *)text {
+    [self appendLog:@"You" content:text color:COLOR_USER];
+    NSDictionary *userMsg = @{ @"role": @"user", @"parts": @[ @{ @"text": text } ] };
+    [self.chatHistory addObject:userMsg];
+    [self saveHistoryToDisk];
     [self callGeminiAPI];
 }
 
 - (void)onUploadClicked {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.allowedContentTypes = @[UTTypePlainText, UTTypeSourceCode, UTTypeJSON, UTTypeXML];
-    panel.allowsMultipleSelection = NO;
+    panel.canChooseFiles = YES;
     panel.canChooseDirectories = NO;
-
+    panel.allowsMultipleSelection = NO;
+    panel.allowedContentTypes = @[UTTypePlainText, UTTypeSourceCode, UTTypeJSON, UTTypeXML, UTTypeHTML, UTTypeSwiftSource, UTTypeObjectiveCSource];
+    
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK) {
             NSURL *url = [panel URLs].firstObject;
-            // [优化] 文件读取也可以放后台，但这里文件通常较小，暂保留
-            NSError *err = nil;
-            NSString *content = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:&err];
+            NSError *readError = nil;
+            NSString *content = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:&readError];
             if (content) {
-                NSString *header = [NSString stringWithFormat:@"[File: %@]", url.lastPathComponent];
-                [self appendLog:header content:nil isHeader:YES];
-                [self addToHistoryWithRole:@"user" text:content];
-                [self callGeminiAPI];
+                NSString *msg = [NSString stringWithFormat:@"[File Upload: %@]\n\n%@", url.lastPathComponent, content];
+                [self processUserMessage:msg];
+            } else {
+                [self appendLog:@"[Error]" content:readError.localizedDescription color:COLOR_ERROR];
             }
         }
     }];
 }
+
+- (void)onClearClicked {
+    [self.chatHistory removeAllObjects];
+    [self saveHistoryToDisk];
+    
+    NSTextStorage *ts = self.textContentStorage.textStorage;
+    [ts beginEditing];
+    [ts replaceCharactersInRange:NSMakeRange(0, ts.length) withString:@""];
+    [ts endEditing];
+    
+    [self appendLog:@"[System]" content:@"History cleared." color:COLOR_SYSTEM];
+}
+
+- (void)callGeminiAPI {
+    [self setUIEnabled:NO];
+    
+    NSURL *url = [NSURL URLWithString:[kModelEndpoint stringByAppendingString:g_apiKey]];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    
+    NSDictionary *payload = @{ @"contents": self.chatHistory };
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setUIEnabled:YES];
+            if (error) {
+                [self appendLog:@"[Network Error]" content:error.localizedDescription color:COLOR_ERROR];
+                return;
+            }
+            [self parseResponse:data];
+        });
+    }] resume];
+}
+
+- (void)parseResponse:(NSData *)data {
+    NSError *err = nil;
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    
+    if (!json) {
+        NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        [self appendLog:@"[Raw Error]" content:raw color:COLOR_ERROR];
+        return;
+    }
+    
+    if (json[@"error"]) {
+        [self appendLog:@"[API Error]" content:json[@"error"][@"message"] color:COLOR_ERROR];
+        return;
+    }
+    
+    NSArray *candidates = json[@"candidates"];
+    if (candidates.count == 0) return;
+    
+    NSArray *parts = candidates[0][@"content"][@"parts"];
+    if (!parts) return;
+    
+    NSMutableString *fullText = [NSMutableString string];
+    for (NSDictionary *part in parts) {
+        if (part[@"thought"]) {
+            [self appendLog:@"Thought" content:part[@"thought"] color:COLOR_THINK];
+        }
+        if (part[@"text"]) {
+            [fullText appendString:part[@"text"]];
+        }
+    }
+    
+    if (fullText.length > 0) {
+        [self appendLog:@"Gemini" content:fullText color:COLOR_MODEL];
+        
+        [self.chatHistory addObject:@{
+            @"role": @"model",
+            @"parts": @[ @{ @"text": [fullText copy] } ]
+        }];
+        [self saveHistoryToDisk];
+    }
+}
+
+// ==========================================
+// 5. 辅助方法 (样式优化重点)
+// ==========================================
+
+- (void)appendLog:(NSString *)header content:(NSString *)content color:(NSColor *)color {
+    // 1. 设置段落样式，增加行间距和段后距
+    NSMutableParagraphStyle *paraStyle = [[NSMutableParagraphStyle alloc] init];
+    paraStyle.lineBreakMode = NSLineBreakByWordWrapping;
+    paraStyle.paragraphSpacing = 16.0;      // 段落之间拉开距离
+    paraStyle.lineHeightMultiple = LINE_HEIGHT_MULT; // 增加行高，减少密集感
+    
+    NSMutableAttributedString *mas = [[NSMutableAttributedString alloc] init];
+    
+    // 2. 标题样式 (Role Name)
+    NSDictionary *headerAttrs = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:FONT_SIZE_HEADER],
+        NSForegroundColorAttributeName: color, // 使用定义好的深蓝/深灰
+        NSParagraphStyleAttributeName: paraStyle
+    };
+    [mas appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@:\n", header] attributes:headerAttrs]];
+    
+    // 3. 内容样式
+    if (content) {
+        NSDictionary *contentAttrs = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:FONT_SIZE_TEXT],
+            NSForegroundColorAttributeName: color, // 正文也使用对应角色的颜色
+            NSParagraphStyleAttributeName: paraStyle
+        };
+        [mas appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@\n", content] attributes:contentAttrs]];
+    }
+    
+    NSTextStorage *ts = self.textContentStorage.textStorage;
+    [ts beginEditing];
+    [ts appendAttributedString:mas];
+    
+    // 分割线留白
+    NSAttributedString *spacing = [[NSAttributedString alloc] initWithString:@"\n" attributes:@{NSParagraphStyleAttributeName: paraStyle}];
+    [ts appendAttributedString:spacing];
+    [ts endEditing];
+    
+    [self scrollToBottom];
+}
+
+- (void)scrollToBottom {
+    [self.textLayoutManager ensureLayoutForRange:self.textContentStorage.documentRange];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.textView.string.length > 0) {
+            [self.textView scrollRangeToVisible:NSMakeRange(self.textView.string.length, 0)];
+        }
+    });
+}
+
+- (void)setUIEnabled:(BOOL)enabled {
+    self.inputField.enabled = enabled;
+    self.sendButton.enabled = enabled;
+}
+
 @end
 
 // ==========================================
-// 3. App Delegate
+// 6. App Entry
 // ==========================================
+
 @interface AppDelegate : NSObject <NSApplicationDelegate>
-@property (strong) MainWindowController *mwc;
+@property (strong) ChatWindowController *windowController;
 @end
 
 @implementation AppDelegate
-- (void)applicationDidFinishLaunching:(NSNotification *)a {
-    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"NSQuitAlwaysKeepsWindows"];
+
+- (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    [self setupMainMenu];
     
-    [self setupMenuBar];
-    self.mwc = [[MainWindowController alloc] init];
-    [self.mwc showWindow:nil];
-    [self.mwc.window toggleFullScreen:nil];
+    self.windowController = [[ChatWindowController alloc] init];
+    [self.windowController showWindow:self];
+    
+    [self.windowController.window toggleFullScreen:nil];
+    
     [NSApp activateIgnoringOtherApps:YES];
+    [self.windowController.window makeKeyAndOrderFront:nil];
 }
 
-- (void)setupMenuBar {
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    return YES;
+}
+
+- (void)setupMainMenu {
     NSMenu *mainMenu = [[NSMenu alloc] init];
+    NSApp.mainMenu = mainMenu;
     
-    NSMenuItem *appMenuItem = [mainMenu addItemWithTitle:@"App" action:nil keyEquivalent:@""];
+    NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
+    [mainMenu addItem:appMenuItem];
     NSMenu *appMenu = [[NSMenu alloc] init];
-    [appMenu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
-    [appMenuItem setSubmenu:appMenu];
+    appMenuItem.submenu = appMenu;
+    [appMenu addItemWithTitle:@"Quit Gemini" action:@selector(terminate:) keyEquivalent:@"q"];
     
-    NSMenuItem *editMenuItem = [mainMenu addItemWithTitle:@"Edit" action:nil keyEquivalent:@""];
+    NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
+    [mainMenu addItem:editMenuItem];
     NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    editMenuItem.submenu = editMenu;
+    
+    [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    [editMenu addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
     [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
     [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
-    [editMenuItem setSubmenu:editMenu];
-    
-    NSMenuItem *viewMenuItem = [mainMenu addItemWithTitle:@"View" action:nil keyEquivalent:@""];
-    NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
-    [viewMenu addItemWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
-    [viewMenuItem setSubmenu:viewMenu];
-    
-    [NSApp setMainMenu:mainMenu];
 }
 
-- (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app { return NO; }
-- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
 @end
 
 int main(int argc, const char * argv[]) {
