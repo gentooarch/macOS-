@@ -2,10 +2,16 @@
  ===========================================================================
  Gemini macOS Client (Eye-Care Light Theme & Paper-like Mode)
  
- 编译命令:
+ [功能特点]
+ 1. 启动即全屏：沉浸式阅读体验
+ 2. 护眼模式：暖白/羊皮纸背景，低对比度文字
+ 3. TextKit 2：高性能文本渲染
+ 4. 历史记录：自动保存聊天记录到 /tmp
+ 
+ [编译命令]
  clang++ -O3 -fobjc-arc -framework Cocoa -framework Foundation -framework UniformTypeIdentifiers main.mm -o Gemini
  
- 运行命令:
+ [运行命令]
  ./Gemini "你的_API_KEY"
  ===========================================================================
  */
@@ -18,12 +24,13 @@
 // ==========================================
 static NSString *g_apiKey = @"key";
 static NSString *const kHistoryFilePath = @"/tmp/gemini_chat_history.json";
-static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
+// 注意：模型名称可能会随时间更新，请根据 Google AI Studio 最新文档调整
+static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=";
 
 // --- 字体与排版配置 ---
 #define FONT_SIZE_TEXT   16.0  // 正文 16pt，适合阅读
 #define FONT_SIZE_HEADER 17.0  // 标题略大
-#define LINE_HEIGHT_MULT 1.25  // 1.4倍行高，类似图书排版，增加呼吸感
+#define LINE_HEIGHT_MULT 1.25  // 1.25倍行高，增加呼吸感
 
 // --- 护眼配色方案 (暖色调/纸张感) ---
 
@@ -68,7 +75,7 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
 
 - (instancetype)init {
     // 1. 创建窗口框架
-    NSRect frame = NSMakeRect(0, 0, 950, 800);
+    NSRect frame = NSMakeRect(0, 0, 1000, 800);
     
     NSUInteger style = NSWindowStyleMaskTitled |
                        NSWindowStyleMaskClosable |
@@ -81,6 +88,7 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
     // 2. 窗口设置
     window.title = @"Gemini Reader";
     window.minSize = NSMakeSize(600, 500);
+    // 关键：允许全屏
     window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
     
     // 透明化基础设置
@@ -88,7 +96,7 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
     window.backgroundColor = [NSColor clearColor];
     window.titlebarAppearsTransparent = YES;
     
-    // 强制使用浅色外观 (Aqua)
+    // 强制使用浅色外观 (Aqua) 以配合暖色纸张主题
     window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
     
     self = [super initWithWindow:window];
@@ -111,25 +119,26 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
     _effectView = [[NSVisualEffectView alloc] initWithFrame:bounds];
     _effectView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     
-    // 使用 UnderPageBackground，这在浅色模式下通常是浅灰白色，不偏色
+    // 使用 UnderPageBackground，这在浅色模式下通常是浅灰白色
     _effectView.material = NSVisualEffectMaterialUnderPageBackground;
     _effectView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     _effectView.state = NSVisualEffectStateActive;
     
     window.contentView = _effectView;
     
-    // [关键修改] 添加一个暖白色的半透明层覆盖在毛玻璃上
-    // 作用：无论壁纸是什么颜色，都能保证背景是柔和的暖纸色，同时保留通透感
+    // 添加一个暖白色的半透明层覆盖在毛玻璃上
+    // 作用：无论壁纸是什么颜色，都能保证背景是柔和的暖纸色
     NSView *tintView = [[NSView alloc] initWithFrame:bounds];
     tintView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     tintView.wantsLayer = YES;
-    // 0.85 的透明度：让暖色为主，透出 15% 的背景模糊，既护眼又现代
+    // 0.85 的透明度：让暖色为主，透出 15% 的背景模糊
     tintView.layer.backgroundColor = [COLOR_BG_PAPER colorWithAlphaComponent:0.85].CGColor;
     [_effectView addSubview:tintView];
     
     // ---------------------------------------------------------
     // B. 文本区域 (TextKit 2)
     // ---------------------------------------------------------
+    // 留出上下边距，中间区域用于显示
     NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(30, 80, bounds.size.width - 60, bounds.size.height - 110)];
     scrollView.hasVerticalScroller = YES;
     scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -157,17 +166,15 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
     _textView.font = [NSFont systemFontOfSize:FONT_SIZE_TEXT];
     _textView.drawsBackground = NO; // 关键：透明
     
-    // 隐藏光标，纯阅读体验更好
-    // _textView.cursor = [NSCursor arrowCursor]; 
-    
     scrollView.documentView = _textView;
-    [_effectView addSubview:scrollView]; // 注意：加在 effectView 上，但在 tintView 之上(因为后添加)
+    [_effectView addSubview:scrollView];
     
     // ---------------------------------------------------------
-    // C. 底部输入区 (样式微调)
+    // C. 底部输入区
     // ---------------------------------------------------------
-    CGFloat bottomY = 25;
+    CGFloat bottomY = 30; // 稍微抬高一点
     CGFloat buttonHeight = 32;
+    CGFloat rightMargin = 30;
     
     _inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(30, bottomY, 600, buttonHeight)];
     _inputField.placeholderString = @"Ask Gemini...";
@@ -177,27 +184,29 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
     _inputField.target = self;
     _inputField.action = @selector(onEnterPressed);
     _inputField.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    // 输入框背景稍微白一点，突出显示
     _inputField.wantsLayer = YES;
-    _inputField.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.5].CGColor;
+    _inputField.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.6].CGColor;
     
     [_effectView addSubview:_inputField];
     
+    // 按钮布局
+    CGFloat btnX = 640;
+    
     _sendButton = [NSButton buttonWithTitle:@"Send" target:self action:@selector(onSendClicked)];
     _sendButton.bezelStyle = NSBezelStyleRounded;
-    _sendButton.frame = NSMakeRect(640, bottomY, 70, buttonHeight);
+    _sendButton.frame = NSMakeRect(btnX, bottomY, 70, buttonHeight);
     _sendButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [_effectView addSubview:_sendButton];
     
     NSButton *uploadBtn = [NSButton buttonWithTitle:@"Upload" target:self action:@selector(onUploadClicked)];
     uploadBtn.bezelStyle = NSBezelStyleRounded;
-    uploadBtn.frame = NSMakeRect(720, bottomY, 70, buttonHeight);
+    uploadBtn.frame = NSMakeRect(btnX + 80, bottomY, 70, buttonHeight);
     uploadBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [_effectView addSubview:uploadBtn];
     
     NSButton *clearBtn = [NSButton buttonWithTitle:@"Clear" target:self action:@selector(onClearClicked)];
     clearBtn.bezelStyle = NSBezelStyleRounded;
-    clearBtn.frame = NSMakeRect(800, bottomY, 70, buttonHeight);
+    clearBtn.frame = NSMakeRect(btnX + 160, bottomY, 70, buttonHeight);
     clearBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [_effectView addSubview:clearBtn];
 }
@@ -425,7 +434,7 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
 @end
 
 // ==========================================
-// 6. App Entry
+// 6. App Entry (程序入口与委托)
 // ==========================================
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -440,11 +449,12 @@ static NSString *const kModelEndpoint = @"https://generativelanguage.googleapis.
     self.windowController = [[ChatWindowController alloc] init];
     [self.windowController showWindow:self];
     
-    // 移除全屏切换，保持窗口模式更适合阅读器感觉，也可以手动全屏
-    [self.windowController.window center];
-    
+    // 1. 激活应用并将窗口前置
     [NSApp activateIgnoringOtherApps:YES];
     [self.windowController.window makeKeyAndOrderFront:nil];
+    
+    // 2. 立即触发全屏模式 (修改点)
+    [self.windowController.window toggleFullScreen:nil];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
