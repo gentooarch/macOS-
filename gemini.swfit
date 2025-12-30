@@ -1,3 +1,4 @@
+//swiftc -parse-as-library Gemini.swift -o Gemini 
 /*
  ===========================================================================
  Gemini macOS Client (Swift Version)
