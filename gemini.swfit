@@ -1,107 +1,232 @@
-//swiftc -O -framework SwiftUI -framework AppKit Gemini.swift -o Gemini
+//swiftc -O -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers Gemini.swift -o Gemini
 import SwiftUI
 import AppKit
 import Observation
+import UniformTypeIdentifiers
 
-// MARK: - 1. 模型层 (保持不变，逻辑层对CPU影响极小)
+// MARK: - 1. 模型层 & 数据结构
+
+struct ChatPart: Codable, Equatable {
+    var text: String?
+    var inlineData: InlineData?
+    
+    var displayString: String { text ?? "" }
+}
+
+struct InlineData: Codable, Equatable {
+    let mimeType: String
+    let data: String // Base64 Encoded
+    
+    enum CodingKeys: String, CodingKey {
+        case mimeType = "mime_type"
+        case data
+    }
+}
+
+struct ChatMessage: Codable, Identifiable, Equatable {
+    var id = UUID()
+    let role: String
+    let parts: [ChatPart]
+    
+    enum CodingKeys: String, CodingKey { case role, parts }
+    
+    static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
+        return lhs.id == rhs.id && lhs.parts == rhs.parts
+    }
+}
+
+struct GeminiResponse: Codable {
+    struct Candidate: Codable {
+        struct Content: Codable { let parts: [ChatPart] }
+        let content: Content
+    }
+    let candidates: [Candidate]?
+}
+
+struct PendingAttachment: Equatable {
+    let url: URL
+    let data: Data
+    let mimeType: String
+}
+
 @Observable
 class ChatViewModel {
     var chatHistory: [ChatMessage] = []
     var isSending = false
     var apiKey: String = ""
-    var isLowPowerMode: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
+    var pendingAttachment: PendingAttachment? = nil
+    var errorMessage: String? = nil
     
-    init() {
-        NotificationCenter.default.addObserver(
-            forName: NSNotification.Name.NSProcessInfoPowerStateDidChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
-        }
-    }
+    private let historyPath = "/tmp/gemini_history_swift.json"
 
     func loadHistory() {
-        let path = "/tmp/gemini_history_swift.json"
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: historyPath)),
               let decoded = try? JSONDecoder().decode([ChatMessage].self, from: data) else { return }
         self.chatHistory = decoded
     }
     
     func saveHistory() {
-        let path = "/tmp/gemini_history_swift.json"
         if let data = try? JSONEncoder().encode(chatHistory) {
-            try? data.write(to: URL(fileURLWithPath: path))
+            try? data.write(to: URL(fileURLWithPath: historyPath))
         }
     }
     
+    func clearHistory() {
+        chatHistory.removeAll()
+        try? FileManager.default.removeItem(atPath: historyPath)
+    }
+    
+    func selectFile() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.image, .pdf]
+        
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.processAttachment(url: url)
+        }
+    }
+    
+    // 修复：添加 Task 包裹以支持异步操作和后台读取
+    private func processAttachment(url: URL) {
+        Task {
+            do {
+                // 在后台线程读取文件，不阻塞 UI
+                let data = try Data(contentsOf: url)
+                
+                if data.count > 4 * 1024 * 1024 {
+                    await MainActor.run {
+                        self.errorMessage = "File too large (Max 4MB recommended)"
+                    }
+                    return
+                }
+                
+                let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                
+                // 回到主线程更新 UI 状态
+                await MainActor.run {
+                    self.pendingAttachment = PendingAttachment(url: url, data: data, mimeType: mimeType)
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = "Failed to read file: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+    
+    func removeAttachment() {
+        pendingAttachment = nil
+    }
+    
     func sendToGemini(text: String) async {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || pendingAttachment != nil else { return }
+        
+        let currentAttachment = pendingAttachment
+        
         await MainActor.run {
-            chatHistory.append(ChatMessage(role: "user", parts: [ChatPart(text: text)]))
+            var parts: [ChatPart] = []
+            
+            if let att = currentAttachment {
+                let base64String = att.data.base64EncodedString()
+                parts.append(ChatPart(text: nil, inlineData: InlineData(mimeType: att.mimeType, data: base64String)))
+            }
+            
+            if !text.isEmpty {
+                parts.append(ChatPart(text: text, inlineData: nil))
+            }
+            
+            chatHistory.append(ChatMessage(role: "user", parts: parts))
             isSending = true
+            pendingAttachment = nil
         }
         
-        // 注意：请确保使用有效的模型名称
-        let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=\(apiKey)"
+        // 使用 gemini-1.5-flash 以获得较好的多模态支持
+        let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=\(apiKey)"
+        
         guard let url = URL(string: endpoint) else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONEncoder().encode(["contents": chatHistory])
+        
+        let apiHistory = chatHistory.map { msg in
+            return [
+                "role": msg.role,
+                "parts": msg.parts.map { part -> [String: Any] in
+                    var dict: [String: Any] = [:]
+                    if let t = part.text { dict["text"] = t }
+                    if let d = part.inlineData {
+                        dict["inline_data"] = ["mime_type": d.mimeType, "data": d.data]
+                    }
+                    return dict
+                }
+            ]
+        }
+        
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["contents": apiHistory])
         
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
+            
             if let response = try? JSONDecoder().decode(GeminiResponse.self, from: data),
-               let modelText = response.candidates.first?.content.parts.first?.text {
+               let candidates = response.candidates,
+               let firstPart = candidates.first?.content.parts.first {
+                
                 await MainActor.run {
-                    chatHistory.append(ChatMessage(role: "model", parts: [ChatPart(text: modelText)]))
+                    let responseText = firstPart.text ?? "No text response"
+                    chatHistory.append(ChatMessage(role: "model", parts: [ChatPart(text: responseText, inlineData: nil)]))
                     saveHistory()
                 }
             } else {
-                if let errorStr = String(data: data, encoding: .utf8) { print("API Error: \(errorStr)") }
+                if let errorStr = String(data: data, encoding: .utf8) {
+                    print("API Error: \(errorStr)")
+                    await MainActor.run { errorMessage = "API Error. Check console." }
+                }
             }
-        } catch { print("Network Error: \(error)") }
+        } catch {
+            print("Network Error: \(error)")
+            await MainActor.run { errorMessage = "Network Error: \(error.localizedDescription)" }
+        }
         await MainActor.run { isSending = false }
     }
 }
 
-struct ChatMessage: Codable, Identifiable, Equatable {
-    var id = UUID(); let role: String; let parts: [ChatPart]
-    enum CodingKeys: String, CodingKey { case role, parts }
-    
-    // Equatable 手动实现：让 View 知道如果 ID 没变，内容就没变
-    static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
-        return lhs.id == rhs.id && lhs.parts.first?.text == rhs.parts.first?.text
-    }
-}
-struct ChatPart: Codable { let text: String }
-struct GeminiResponse: Codable {
-    struct Candidate: Codable {
-        struct Content: Codable { let parts: [ChatPart] }; let content: Content
-    }
-    let candidates: [Candidate]
-}
+// MARK: - 2. UI 层
 
-// MARK: - 2. UI 层 (深度优化)
-
-// 优化 1: 提取单独的 Row View 并遵守 Equatable
-// 这可以防止 ScrollView 在更新时重绘所有的 Text，只绘制新增的
 struct MessageRow: View, Equatable {
     let msg: ChatMessage
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(msg.role == "user" ? "You" : "Gemini")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.secondary)
             
-            Text(msg.parts.first?.text ?? "")
-                .font(.system(size: 15)) // 稍微减小字号以提升渲染密度
-                .lineSpacing(4)
-                .fixedSize(horizontal: false, vertical: true) // 确切告诉布局引擎只需垂直扩展
-                .foregroundColor(msg.role == "user" ? .primary : Color(nsColor: .darkGray))
-                .textSelection(.enabled)
+            ForEach(msg.parts.indices, id: \.self) { index in
+                let part = msg.parts[index]
+                
+                if let text = part.text {
+                    Text(text)
+                        .font(.system(size: 15))
+                        .lineSpacing(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .foregroundColor(msg.role == "user" ? .primary : Color(nsColor: .darkGray))
+                        .textSelection(.enabled)
+                }
+                
+                if let inline = part.inlineData,
+                   let data = Data(base64Encoded: inline.data),
+                   let nsImage = NSImage(data: data) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: 300, maxHeight: 300)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2), lineWidth: 1))
+                }
+            }
         }
         .padding(.vertical, 4)
     }
@@ -111,77 +236,143 @@ struct MessageRow: View, Equatable {
     }
 }
 
+struct AttachmentPreview: View {
+    let attachment: PendingAttachment
+    var onRemove: () -> Void
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.fill")
+                .foregroundColor(.blue)
+            Text(attachment.url.lastPathComponent)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.gray)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(6)
+        .background(Color.blue.opacity(0.1))
+        .cornerRadius(6)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.blue.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
 struct ContentView: View {
     @Bindable var viewModel: ChatViewModel
     @State private var inputText = ""
     
-    // 使用纯色代替材质，显著降低 CPU
     let paperColor = Color(red: 0.98, green: 0.976, blue: 0.965)
     let inputAreaColor = Color(red: 0.95, green: 0.95, blue: 0.95)
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button(action: { viewModel.clearHistory() }) {
+                    Image(systemName: "trash")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear History")
+                .padding(.trailing, 20)
+                .padding(.top, 10)
+            }
+            
             ScrollViewReader { proxy in
                 ScrollView {
-                    // 保持 VStack 以解决按键滚动问题，但因为内部 View 是 Equatable，性能依然很高
                     VStack(alignment: .leading, spacing: 20) {
                         ForEach(viewModel.chatHistory) { msg in
                             MessageRow(msg: msg)
                                 .id(msg.id)
                         }
                     }
-                    .padding(24) // 减少 padding 复杂度
+                    .padding(24)
                 }
                 .focusable()
                 .onChange(of: viewModel.chatHistory.count) {
                     if let lastId = viewModel.chatHistory.last?.id {
-                        // 使用动画可能导致 CPU 峰值，immediate 滚动更省资源
                         proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
             }
             
-            // 底部输入区
-            HStack(spacing: 10) {
-                TextField("Ask Gemini...", text: $inputText)
-                    .textFieldStyle(.plain) // 自定义样式比 roundedBorder 更轻量
-                    .padding(8)
-                    .background(Color.white)
-                    .cornerRadius(6)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color.gray.opacity(0.2), lineWidth: 1)
-                    )
-                    .onSubmit { sendMessage() }
-                    .disabled(viewModel.isSending)
+            VStack(spacing: 0) {
+                Divider()
                 
-                Button(action: sendMessage) {
-                    if viewModel.isSending {
-                        ProgressView().controlSize(.small).scaleEffect(0.8)
-                    } else {
-                        Text("Send").fontWeight(.medium)
+                VStack(alignment: .leading, spacing: 8) {
+                    if let attachment = viewModel.pendingAttachment {
+                        AttachmentPreview(attachment: attachment) {
+                            viewModel.removeAttachment()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
+                    
+                    HStack(spacing: 10) {
+                        Button(action: { viewModel.selectFile() }) {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 18))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Attach Image or PDF")
+                        
+                        TextField("Ask Gemini...", text: $inputText)
+                            .textFieldStyle(.plain)
+                            .padding(8)
+                            .background(Color.white)
+                            .cornerRadius(6)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+                            )
+                            .onSubmit { sendMessage() }
+                            .disabled(viewModel.isSending)
+                        
+                        Button(action: sendMessage) {
+                            if viewModel.isSending {
+                                ProgressView().controlSize(.small).scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(inputText.isEmpty && viewModel.pendingAttachment == nil ? .gray : .blue)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(inputText.isEmpty && viewModel.pendingAttachment == nil)
+                    }
+                    .padding(12)
                 }
-                .buttonStyle(.bordered) // Prominent 样式有时候绘制开销稍大
-            }
-            .padding(12)
-            // 优化 2: 移除 Material，使用实色背景
-            // .ultraThinMaterial 会导致 Window Server 持续进行背景模糊运算
-            .background(inputAreaColor)
-            .overlay(alignment: .top) {
-                Divider() // 简单的分割线代替复杂的阴影
+                .background(inputAreaColor)
             }
         }
-        .background(paperColor) 
+        .background(paperColor)
+        .alert("Error", isPresented: Binding(get: { viewModel.errorMessage != nil }, set: { _ in viewModel.errorMessage = nil })) {
+            Button("OK", role: .cancel) { viewModel.errorMessage = nil }
+        } message: {
+            Text(viewModel.errorMessage ?? "")
+        }
     }
     
     func sendMessage() {
-        let text = inputText; guard !text.isEmpty else { return }; inputText = ""
+        let text = inputText
+        guard !text.isEmpty || viewModel.pendingAttachment != nil else { return }
+        inputText = ""
         Task { await viewModel.sendToGemini(text: text) }
     }
 }
 
-// MARK: - 3. 应用入口 (保持不变)
+// MARK: - 3. 应用入口
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var viewModel = ChatViewModel()
@@ -192,13 +383,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         viewModel.loadHistory()
 
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 550), // 稍微调小默认窗口
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
         window.center()
         window.title = "Gemini Reader"
-        // 移除全透明相关设置，提升渲染性能
-        window.isOpaque = true 
+        window.isOpaque = true
         window.titlebarAppearsTransparent = true
         
         window.contentView = NSHostingView(rootView: ContentView(viewModel: viewModel))
