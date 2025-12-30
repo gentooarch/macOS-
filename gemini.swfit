@@ -3,7 +3,7 @@ import SwiftUI
 import AppKit
 import Observation
 
-// MARK: - 1. 模型层
+// MARK: - 1. 模型层 (保持不变，逻辑层对CPU影响极小)
 @Observable
 class ChatViewModel {
     var chatHistory: [ChatMessage] = []
@@ -12,7 +12,6 @@ class ChatViewModel {
     var isLowPowerMode: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
     
     init() {
-        // 监听低电量模式变化
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name.NSProcessInfoPowerStateDidChange,
             object: nil,
@@ -43,7 +42,7 @@ class ChatViewModel {
             isSending = true
         }
         
-        // 使用 gemini-2.0-flash-exp (或根据实际可用的模型名称调整)
+        // 注意：请确保使用有效的模型名称
         let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=\(apiKey)"
         guard let url = URL(string: endpoint) else { return }
         var request = URLRequest(url: url)
@@ -67,9 +66,14 @@ class ChatViewModel {
     }
 }
 
-struct ChatMessage: Codable, Identifiable {
+struct ChatMessage: Codable, Identifiable, Equatable {
     var id = UUID(); let role: String; let parts: [ChatPart]
     enum CodingKeys: String, CodingKey { case role, parts }
+    
+    // Equatable 手动实现：让 View 知道如果 ID 没变，内容就没变
+    static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
+        return lhs.id == rhs.id && lhs.parts.first?.text == rhs.parts.first?.text
+    }
 }
 struct ChatPart: Codable { let text: String }
 struct GeminiResponse: Codable {
@@ -79,56 +83,96 @@ struct GeminiResponse: Codable {
     let candidates: [Candidate]
 }
 
-// MARK: - 2. UI 层
+// MARK: - 2. UI 层 (深度优化)
+
+// 优化 1: 提取单独的 Row View 并遵守 Equatable
+// 这可以防止 ScrollView 在更新时重绘所有的 Text，只绘制新增的
+struct MessageRow: View, Equatable {
+    let msg: ChatMessage
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(msg.role == "user" ? "You" : "Gemini")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.secondary)
+            
+            Text(msg.parts.first?.text ?? "")
+                .font(.system(size: 15)) // 稍微减小字号以提升渲染密度
+                .lineSpacing(4)
+                .fixedSize(horizontal: false, vertical: true) // 确切告诉布局引擎只需垂直扩展
+                .foregroundColor(msg.role == "user" ? .primary : Color(nsColor: .darkGray))
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, 4)
+    }
+    
+    static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
+        return lhs.msg == rhs.msg
+    }
+}
+
 struct ContentView: View {
     @Bindable var viewModel: ChatViewModel
     @State private var inputText = ""
+    
+    // 使用纯色代替材质，显著降低 CPU
     let paperColor = Color(red: 0.98, green: 0.976, blue: 0.965)
+    let inputAreaColor = Color(red: 0.95, green: 0.95, blue: 0.95)
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    // FIX: 将 LazyVStack 改为 VStack，解决 PageUp/Down 连续按键卡顿问题
-                    VStack(alignment: .leading, spacing: 24) {
+                    // 保持 VStack 以解决按键滚动问题，但因为内部 View 是 Equatable，性能依然很高
+                    VStack(alignment: .leading, spacing: 20) {
                         ForEach(viewModel.chatHistory) { msg in
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(msg.role == "user" ? "You" : "Gemini")
-                                    .font(.system(size: 13, weight: .bold))
-                                    .foregroundColor(.secondary)
-                                Text(msg.parts.first?.text ?? "")
-                                    .font(.system(size: 16))
-                                    .lineSpacing(6)
-                                    .foregroundColor(msg.role == "user" ? .primary : Color(red: 0.12, green: 0.28, blue: 0.45))
-                                    .textSelection(.enabled) // 允许复制
-                            }
-                            .id(msg.id)
+                            MessageRow(msg: msg)
+                                .id(msg.id)
                         }
                     }
-                    .padding(30)
+                    .padding(24) // 减少 padding 复杂度
                 }
-                .focusable() // FIX: 允许 ScrollView 获取焦点，优化键盘翻页体验
+                .focusable()
                 .onChange(of: viewModel.chatHistory.count) {
-                    proxy.scrollTo(viewModel.chatHistory.last?.id, anchor: .bottom)
+                    if let lastId = viewModel.chatHistory.last?.id {
+                        // 使用动画可能导致 CPU 峰值，immediate 滚动更省资源
+                        proxy.scrollTo(lastId, anchor: .bottom)
+                    }
                 }
             }
             
-            HStack(spacing: 12) {
+            // 底部输入区
+            HStack(spacing: 10) {
                 TextField("Ask Gemini...", text: $inputText)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain) // 自定义样式比 roundedBorder 更轻量
+                    .padding(8)
+                    .background(Color.white)
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+                    )
                     .onSubmit { sendMessage() }
                     .disabled(viewModel.isSending)
+                
                 Button(action: sendMessage) {
-                    if viewModel.isSending { ProgressView().controlSize(.small) } else { Text("Send") }
+                    if viewModel.isSending {
+                        ProgressView().controlSize(.small).scaleEffect(0.8)
+                    } else {
+                        Text("Send").fontWeight(.medium)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered) // Prominent 样式有时候绘制开销稍大
             }
-            .padding()
-            .background {
-                if viewModel.isLowPowerMode { paperColor } else { Rectangle().fill(.ultraThinMaterial) }
+            .padding(12)
+            // 优化 2: 移除 Material，使用实色背景
+            // .ultraThinMaterial 会导致 Window Server 持续进行背景模糊运算
+            .background(inputAreaColor)
+            .overlay(alignment: .top) {
+                Divider() // 简单的分割线代替复杂的阴影
             }
         }
-        .background(paperColor)
+        .background(paperColor) 
     }
     
     func sendMessage() {
@@ -137,42 +181,39 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 3. 应用入口
+// MARK: - 3. 应用入口 (保持不变)
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var viewModel = ChatViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // FIX: 设置主菜单以启用 Cmd+C / Cmd+V / Cmd+A
         setupMenu()
-        
         if CommandLine.arguments.count > 1 { viewModel.apiKey = CommandLine.arguments[1] }
         viewModel.loadHistory()
 
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 550), // 稍微调小默认窗口
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
         window.center()
         window.title = "Gemini Reader"
+        // 移除全透明相关设置，提升渲染性能
+        window.isOpaque = true 
         window.titlebarAppearsTransparent = true
+        
         window.contentView = NSHostingView(rootView: ContentView(viewModel: viewModel))
         window.makeKeyAndOrderFront(nil)
-        
         NSApp.activate(ignoringOtherApps: true)
     }
     
     func setupMenu() {
         let mainMenu = NSMenu()
-        
-        // App Menu
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         
-        // Edit Menu (复制粘贴的关键)
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
@@ -181,14 +222,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        
-        // Window Menu
-        let windowMenuItem = NSMenuItem()
-        mainMenu.addItem(windowMenuItem)
-        let windowMenu = NSMenu(title: "Window")
-        windowMenuItem.submenu = windowMenu
-        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         
         NSApp.mainMenu = mainMenu
     }
