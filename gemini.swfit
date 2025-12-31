@@ -1,4 +1,5 @@
-//swiftc -parse-as-library Gemini.swift -o Gemini
+//swiftc -O -target-cpu native -parse-as-library Gemini.swift -o Gemini
+//swiftc -Ounchecked -target-cpu native -parse-as-library Gemini.swift -o Gemini
 /*
  ===========================================================================
  Gemini macOS Client (Swift Version) - High Performance Edition
