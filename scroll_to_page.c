@@ -1,3 +1,4 @@
+//gcc -framework ApplicationServices -framework CoreFoundation scroll_to_page.c -o scroll_to_page
 #include <ApplicationServices/ApplicationServices.h>
 #include <stdio.h>
 
